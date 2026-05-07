@@ -29,6 +29,7 @@ class CustomAPIServerExtensions:
             ("eventos", self._mount_eventos),
             ("postador_ads", self._mount_postador_ads),
             ("relatorios", self._mount_relatorios),
+            ("feedback", self._mount_feedback),
         ]
         for name, mount in mounts:
             try:
@@ -103,3 +104,9 @@ class CustomAPIServerExtensions:
         from gateway.platforms._custom.relatorios_router import mount_relatorios_subapp
 
         mount_relatorios_subapp(app, adapter)
+
+    @staticmethod
+    def _mount_feedback(app: Any, adapter: Any) -> None:
+        from gateway.platforms._custom.feedback_router import mount_feedback_subapp
+
+        mount_feedback_subapp(app, adapter)
