@@ -28,6 +28,7 @@ class CustomAPIServerExtensions:
             ("thumbnail", self._mount_thumbnail),
             ("eventos", self._mount_eventos),
             ("postador_ads", self._mount_postador_ads),
+            ("relatorios", self._mount_relatorios),
         ]
         for name, mount in mounts:
             try:
@@ -96,3 +97,9 @@ class CustomAPIServerExtensions:
         from gateway.platforms._custom.postador_ads_router import mount_postador_ads_subapp
 
         mount_postador_ads_subapp(app, adapter)
+
+    @staticmethod
+    def _mount_relatorios(app: Any, adapter: Any) -> None:
+        from gateway.platforms._custom.relatorios_router import mount_relatorios_subapp
+
+        mount_relatorios_subapp(app, adapter)
