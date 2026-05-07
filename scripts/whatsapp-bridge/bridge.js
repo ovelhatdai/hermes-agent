@@ -24,11 +24,12 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
-import { randomBytes } from 'crypto';
-import { execSync } from 'child_process';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
+import { execSync, spawn } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { createChipManagerBridge } from './chip-manager.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -43,7 +44,7 @@ const WHATSAPP_DEBUG =
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
-const PORT = parseInt(getArg('port', '3000'), 10);
+const PORT = parseInt(getArg('port', '3030'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
@@ -51,6 +52,85 @@ const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cac
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+// SPEC-060: whitelist de grupo (alem do gate de @mention)
+const ALLOWED_GROUPS = new Set(
+  String(process.env.WHATSAPP_ALLOWED_GROUPS || '')
+    .split(',').map(s => s.trim()).filter(Boolean)
+);
+const TRAFEGO_ACK_URL = (process.env.TRAFEGO_ACK_URL || 'http://127.0.0.1:8642/api/trafego/hermes-ack').trim();
+const TRAFEGO_ACK_TOKEN = (process.env.HERMES_INBOUND_TOKEN || process.env.FOFO_INBOUND_TOKEN || '').trim();
+const TRAFEGO_ACK_STAFF = new Set(
+  String(process.env.TRAFEGO_ACK_ALLOWED_PHONES || '5551989150954,5551980148849,5551991987972,5551991518441,5551984580681,5551992559674')
+    .split(',').map(s => s.replace(/\D/g, '')).filter(Boolean)
+);
+const TRAFEGO_ACK_COMMAND_RE = /\b(?:vi|ack|assumi|assumido)\b|\bvou\s+agora\b|\bj[aá]\s+t[oô]\s+em\b|\bsilenci(?:a|ar)\b/i;
+const TRAFEGO_ACK_CARD_RE = /(?:#\s*|\bcard\s+)(\d+)\b/i;
+// SPEC-060: modo tradutor (grupo especifico + regex palavras-chave)
+const TRANSLATOR_GROUP = (process.env.WHATSAPP_TRANSLATOR_GROUP || '').trim();
+const TRANSLATOR_REGEX = /(@?hermes\s+(traduz|explica|nos ajude entender|explica ai|me ajude)|\btraduz\s+ai\b)/i;
+const TRANSLATOR_PROMPT_PREFIX = `[MODO TRADUTOR T1 — EXECUTE A TRADUCAO, NAO ENSINE COMO TRADUZIR. Voce esta no grupo da mentoria Revolucao T1 (grupo de advogadas/alunas comecando em IA) e um aluno te mencionou. Sua tarefa: responder em portugues de forma SIMPLES MAS COM SUBSTANCIA. SEMPRE ancore a resposta num motivo concreto/tecnico real, nao fique so na analogia. Estrutura recomendada (5-10 linhas): (1) 1 frase direta com o motivo real em linguagem simples (ex: "X e melhor porque Y mantem o contexto inteiro em um lugar so"), (2) 1 analogia curta fora de tech pra ancorar, (3) 1 frase fechando com o impacto pratico ("por isso da menos retrabalho", "por isso o agente sai mais pronto", etc). Pode explicar conceitos tecnicos com palavras simples, mas NUNCA abra mao da substancia — a pessoa quer entender o POR QUE de verdade, nao so uma metafora bonita. Se jargao for inevitavel, explica em parenteses ("skill = receita que o agente segue"). REGRA DE CONTEXTO: se o aluno pedir pra traduzir o que OUTRA pessoa disse ("explica o que X quis dizer", "o que o fulano falou") e voce NAO tem a fala dessa pessoa no contexto atual, responda pedindo pra ele citar/marcar em resposta a mensagem especifica (reply no WhatsApp). NAO invente o que a pessoa disse. NAO responda com template/exemplo generico. PROIBIDO mencionar: outros agentes internos (Clara, Benicio, Larissinha, Mordomo, Fofoqueiro, Bia, Helena, Bebela), SPECs, precos de produtos internos (TAG, 25K, 100K, Revolucao, planos), nomes de mentoradas, infraestrutura, chips, APIs, credenciais. Pergunta do aluno:]\n\n`;
+
+// SPEC-060 (Opcao B): busca historico direto do Evolution DB via docker exec psql
+// - Fonte: Postgres container advogando_postgres, db=evolution, tabela "Message"
+// - Extrai texto de conversation / extendedTextMessage / image/video caption
+// - Roda em qualquer grupo (basta estar em WHATSAPP_ALLOWED_GROUPS)
+const TRANSLATOR_HISTORY_COUNT = 15;       // quantas msgs trazer
+const TRANSLATOR_HISTORY_WINDOW_SEC = 86400; // janela de 24h
+const PSQL_DOCKER_CONTAINER = process.env.EVOLUTION_PG_CONTAINER || 'advogando_postgres';
+const PSQL_DB               = process.env.EVOLUTION_PG_DB        || 'evolution';
+const PSQL_USER             = process.env.EVOLUTION_PG_USER      || 'postgres';
+function escapeSqlLiteral(s) { return String(s).replace(/'/g, "''"); }
+function fetchGroupHistory(chatId, count = TRANSLATOR_HISTORY_COUNT, windowSec = TRANSLATOR_HISTORY_WINDOW_SEC) {
+  return new Promise((resolve) => {
+    const safeChatId = escapeSqlLiteral(chatId);
+    const query = `
+      SELECT sender, body, ts, from_me FROM (
+        SELECT DISTINCT ON ("key"->>'id')
+          "key"->>'id' AS wa_id,
+          COALESCE("pushName", 'desconhecido') AS sender,
+          COALESCE(
+            "message"->>'conversation',
+            "message"->'extendedTextMessage'->>'text',
+            "message"->'imageMessage'->>'caption',
+            "message"->'videoMessage'->>'caption',
+            ''
+          ) AS body,
+          "messageTimestamp" AS ts,
+          ("key"->>'fromMe')::boolean AS from_me
+        FROM "Message"
+        WHERE "key"->>'remoteJid' = '${safeChatId}'
+          AND "messageTimestamp" > (EXTRACT(EPOCH FROM NOW())::int - ${Number(windowSec)})
+          AND "messageType" IN ('conversation', 'extendedTextMessage', 'imageMessage', 'videoMessage')
+      ) s
+      WHERE body IS NOT NULL AND length(trim(body)) > 0
+      ORDER BY ts DESC
+      LIMIT ${Number(count)};
+    `;
+    const proc = spawn('docker', [
+      'exec', '-i', PSQL_DOCKER_CONTAINER,
+      'psql', '-U', PSQL_USER, '-d', PSQL_DB,
+      '-t', '-A', '-F', '\t', '-c', query,
+    ], { timeout: 5000 });
+    let out = '', err = '';
+    proc.stdout.on('data', d => out += d.toString());
+    proc.stderr.on('data', d => err += d.toString());
+    proc.on('close', () => {
+      if (err && !out) { console.error('[bridge] psql err:', err.trim().slice(0, 200)); return resolve([]); }
+      const rows = out.split('\n').filter(Boolean).map(line => {
+        const [sender, body, ts, fromMe] = line.split('\t');
+        return { sender, body: String(body || '').slice(0, 500), ts: Number(ts) || 0, fromMe: fromMe === 't' };
+      }).filter(r => r.body && r.body.trim().length > 0);
+      rows.reverse(); // ordem cronologica
+      resolve(rows);
+    });
+    proc.on('error', e => { console.error('[bridge] spawn psql:', e.message); resolve([]); });
+  });
+}
+function formatGroupContextRows(rows) {
+  if (!rows || rows.length === 0) return '';
+  return rows.map(r => `[${r.sender}] ${r.body}`).join('\n');
+}
+
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -129,6 +209,22 @@ function getContextInfo(messageContent) {
   return {};
 }
 
+function extractQuotedText(messageContent) {
+  const quoted = getContextInfo(messageContent)?.quotedMessage;
+  if (!quoted || typeof quoted !== 'object') return '';
+  return quoted.conversation || quoted.extendedTextMessage?.text || quoted.imageMessage?.caption || quoted.videoMessage?.caption || '';
+}
+
+function extractPlainText(messageContent) {
+  if (!messageContent || typeof messageContent !== 'object') return '';
+  return messageContent.conversation
+    || messageContent.extendedTextMessage?.text
+    || messageContent.imageMessage?.caption
+    || messageContent.videoMessage?.caption
+    || messageContent.documentMessage?.caption
+    || '';
+}
+
 mkdirSync(SESSION_DIR, { recursive: true });
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
@@ -147,6 +243,49 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
+function senderPhoneFromId(senderId) {
+  const raw = String(senderId || '').replace(/@.*/, '').replace(/:.*$/, '');
+  const mapped = lidToPhone[raw] || raw;
+  return String(mapped || '').replace(/\D/g, '');
+}
+
+async function maybeHandleTrafegoAck({ body, senderId, senderName }) {
+  if (!TRAFEGO_ACK_TOKEN || !body || !TRAFEGO_ACK_COMMAND_RE.test(body) || !TRAFEGO_ACK_CARD_RE.test(body)) {
+    return false;
+  }
+
+  const senderPhone = senderPhoneFromId(senderId);
+  if (!TRAFEGO_ACK_STAFF.has(senderPhone)) {
+    return false;
+  }
+
+  try {
+    const response = await fetch(TRAFEGO_ACK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hermes-Token': TRAFEGO_ACK_TOKEN,
+      },
+      body: JSON.stringify({
+        text: body,
+        senderPhone,
+        senderId,
+        senderName,
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      console.warn(`[SPEC-110] trafego ack webhook failed status=${response.status} detail=${detail.slice(0, 200)}`);
+      return false;
+    }
+    console.log(`[SPEC-110] trafego ack webhook accepted sender=${senderPhone}`);
+    return true;
+  } catch (error) {
+    console.warn(`[SPEC-110] trafego ack webhook error: ${error.message}`);
+    return false;
+  }
+}
+
 const logger = pino({ level: 'warn' });
 
 // Message queue for polling
@@ -159,6 +298,13 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+
+const chipManagerBridge = createChipManagerBridge({
+  botId: 'hermes',
+  logger: console,
+  getMeta: () => ({ connection_state: connectionState }),
+});
+chipManagerBridge.startHeartbeat();
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -284,6 +430,46 @@ async function startSocket() {
           } catch {}
           continue;
         }
+
+        // Skip group messages UNLESS Hermes is @mentioned.
+        // Group msgs from allowed users (e.g. Vinicius) were leaking through
+        // because the old isGroup filter was inside the fromMe block only.
+        // Fix: ignore groups by default, but allow when @mentioned by JID or LID.
+        if (isGroup) {
+          const messageContent_ = getMessageContent(msg);
+          const contextInfo_ = getContextInfo(messageContent_);
+          const mentions = (contextInfo_?.mentionedJid || []).map(j => String(j).replace(/:.*@/, '@').replace(/@.*/, ''));
+          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const isMentioned = mentions.some(m => (myNumber && m === myNumber) || (myLid && m === myLid));
+
+          if (!isMentioned) {
+            if (WHATSAPP_DEBUG) console.log(`[GROUP-SKIP] No @mention, ignoring group msg from ${senderNumber} in ${chatId}`);
+            continue;
+          }
+          if (WHATSAPP_DEBUG) console.log(`[GROUP-MENTION] @mentioned in group ${chatId} by ${senderNumber}, processing`);
+        }
+
+        // SPEC-060: se WHATSAPP_ALLOWED_GROUPS estiver definida, so libera grupos listados.
+        // DM nao e afetada. Se variavel vazia, comportamento original (libera todos grupos mencionados).
+        if (isGroup && ALLOWED_GROUPS.size > 0 && !ALLOWED_GROUPS.has(chatId)) {
+          if (WHATSAPP_DEBUG) console.log(`[GROUP-BLOCK] ${chatId} not in ALLOWED_GROUPS, dropping`);
+          continue;
+        }
+
+        if (!isGroup) {
+          const ackBody = extractPlainText(getMessageContent(msg));
+          const acked = await maybeHandleTrafegoAck({
+            body: ackBody,
+            senderId,
+            senderName: msg.pushName || senderNumber,
+          });
+          if (acked) {
+            continue;
+          }
+        }
+
+        // Check allowlist for messages from others (resolve LID ↔ phone aliases)
         if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({
@@ -400,6 +586,29 @@ async function startSocket() {
         continue;
       }
 
+      if (!msg.key.fromMe && !isGroup) {
+        const acked = await chipManagerBridge.maybeAckIncomingAlert({
+          chatId,
+          text: body,
+          quotedText: extractQuotedText(messageContent),
+          senderPhone: senderNumber,
+        });
+        if (acked) {
+          continue;
+        }
+      }
+
+      // SPEC-060: injeta diretriz de tradutor se no grupo configurado + regex bate
+      if (isGroup && ALLOWED_GROUPS.has(chatId)) {
+        const rows = await fetchGroupHistory(chatId);
+        const history = formatGroupContextRows(rows);
+        const historyBlock = history
+          ? `\n\n--- ULTIMAS ${rows.length} MENSAGENS DO GRUPO (contexto real vindo do DB; NAO repita nem traduza uma por uma, use para entender do que estao falando) ---\n${history}\n--- FIM HISTORICO ---\n\n`
+          : '';
+        if (WHATSAPP_DEBUG) console.log(`[TRANSLATOR-MODE] chatId=${chatId} prefix + ${rows.length} msgs do DB`);
+        body = TRANSLATOR_PROMPT_PREFIX + historyBlock + body;
+      }
+
       const event = {
         messageId: msg.key.id,
         chatId,
@@ -425,40 +634,36 @@ async function startSocket() {
   });
 }
 
+
+function hasValidBackupWebhookSecret(providedSecret) {
+  const expectedSecret = process.env.HERMES_SHARED_SECRET || '';
+  if (!providedSecret || !expectedSecret) return false;
+
+  const providedDigest = createHash('sha256').update(String(providedSecret)).digest();
+  const expectedDigest = createHash('sha256').update(expectedSecret).digest();
+  return timingSafeEqual(providedDigest, expectedDigest);
+}
+
+async function sendTextMessage(chatId, message) {
+  const sent = await sock.sendMessage(chatId, {
+    text: formatOutgoingMessage(message),
+    linkPreview: null,
+  });
+  chipManagerBridge.rememberOutgoingAlert(chatId, message);
+
+  if (sent?.key?.id) {
+    recentlySentIds.add(sent.key.id);
+    if (recentlySentIds.size > MAX_RECENT_IDS) {
+      recentlySentIds.delete(recentlySentIds.values().next().value);
+    }
+  }
+
+  return sent;
+}
+
 // HTTP server
 const app = express();
 app.use(express.json());
-
-// Host-header validation — defends against DNS rebinding.
-// The bridge binds loopback-only (127.0.0.1) but a victim browser on
-// the same machine could be tricked into fetching from an attacker
-// hostname that TTL-flips to 127.0.0.1. Reject any request whose Host
-// header doesn't resolve to a loopback alias.
-// See GHSA-ppp5-vxwm-4cf7.
-const _ACCEPTED_HOST_VALUES = new Set([
-  'localhost',
-  '127.0.0.1',
-  '[::1]',
-  '::1',
-]);
-
-app.use((req, res, next) => {
-  const raw = (req.headers.host || '').trim();
-  if (!raw) {
-    return res.status(400).json({ error: 'Missing Host header' });
-  }
-  // Strip port suffix: "localhost:3000" → "localhost"
-  const hostOnly = (raw.includes(':')
-    ? raw.substring(0, raw.lastIndexOf(':'))
-    : raw
-  ).replace(/^\[|\]$/g, '').toLowerCase();
-  if (!_ACCEPTED_HOST_VALUES.has(hostOnly)) {
-    return res.status(400).json({
-      error: 'Invalid Host header. Bridge accepts loopback hosts only.',
-    });
-  }
-  next();
-});
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
@@ -478,11 +683,10 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const chunks = splitLongMessage(message);
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sock.sendMessage(chatId, { text: chunks[i] });
-      trackSentMessageId(sent);
+      const sent = await sendTextMessage(chatId, chunks[i]);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
@@ -499,6 +703,48 @@ app.post('/send', async (req, res) => {
   }
 });
 
+
+app.post('/api/webhook/backup-alert', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const providedSecret = req.headers['x-hermes-secret'];
+  if (!hasValidBackupWebhookSecret(providedSecret)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { source, severity, message, host } = req.body || {};
+  if (!source || !severity || !message || !host) {
+    return res.status(400).json({ error: 'source, severity, message, and host are required' });
+  }
+
+  const emoji = severity === 'critical' ? '🚨' : '⚠️';
+  const text = `${emoji} *Backup alert* (${source})
+Host: ${host}
+Severity: ${severity}
+
+${String(message).slice(0, 3500)}`;
+
+  const results = await Promise.allSettled([
+    sendTextMessage('5551991987972@s.whatsapp.net', text),
+    sendTextMessage('5551984213925@s.whatsapp.net', text),
+  ]);
+
+  const delivered = results.filter(result => result.status === 'fulfilled').length;
+  const failed = results.filter(result => result.status === 'rejected');
+  console.log('[backup-alert] delivery summary', { source, severity, delivered, failed: failed.length });
+  if (failed.length > 0) {
+    console.error('[backup-alert] partial delivery failure', {
+      source,
+      severity,
+      failed: failed.map(result => result.reason?.message || String(result.reason)),
+    });
+  }
+
+  res.json({ ok: true, delivered, failed: failed.length });
+});
+
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
@@ -512,14 +758,17 @@ app.post('/edit', async (req, res) => {
 
   try {
     const key = { id: messageId, fromMe: true, remoteJid: chatId };
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const chunks = splitLongMessage(message);
     const messageIds = [];
 
-    await sock.sendMessage(chatId, { text: chunks[0], edit: key });
+    await sock.sendMessage(chatId, {
+      text: formatOutgoingMessage(chunks[0]),
+      edit: key,
+      linkPreview: null,
+    });
     if (chunks.length > 1) {
       for (let i = 1; i < chunks.length; i += 1) {
-        const sent = await sock.sendMessage(chatId, { text: chunks[i] });
-        trackSentMessageId(sent);
+        const sent = await sendTextMessage(chatId, chunks[i]);
         if (sent?.key?.id) messageIds.push(sent.key.id);
         if (i < chunks.length - 1) {
           await sleep(CHUNK_DELAY_MS);

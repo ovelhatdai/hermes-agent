@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ import platform
 import re
 import signal
 import subprocess
+import sys
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -31,6 +33,99 @@ from typing import Dict, Optional, Any
 from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
+
+_CONTENT_CAPTURE_TRIGGERS = (
+    "#pilula",
+    "pilula:",
+    "ideia de conteudo:",
+    "guarda essa ideia:",
+    "anota ai",
+    "guarda essa",
+)
+_CONTENT_CAPTURE_ALLOWED_SENDERS = (
+    "143658066157619@lid",
+    "5551991987972",
+    "5551991987972@s.whatsapp.net",
+    "+5551991987972",
+)
+_CONTENT_CAPTURE_WORKER = os.getenv(
+    "CONTENT_CAPTURE_WORKER",
+    "/opt/hermes-content/content_capture.py",
+)
+_CONTENT_LINK_ANALYZER_TRIGGERS = (
+    "#pilula",
+    "copia esse jeito",
+    "monta um igual",
+    "gera um pra mim no estilo",
+)
+_CONTENT_LINK_ANALYZER_FOLLOWUPS = (
+    "gera",
+    "gerar",
+    "gera ai",
+    "gera pra mim",
+    "so guarda",
+    "só guarda",
+    "guarda so",
+    "guarda só",
+    "guarda",
+)
+_CONTENT_LINK_ANALYZER_WORKER = os.getenv(
+    "CONTENT_LINK_ANALYZER_WORKER",
+    "/opt/hermes-content/content_link_analyzer.py",
+)
+_CONTENT_MEDIA_ROOT = Path(os.getenv("CONTENT_MEDIA_ROOT", "/opt/hermes-content"))
+_CONTENT_MEDIA_AVATAR_REGISTRY = Path(
+    os.getenv(
+        "CONTENT_MEDIA_AVATAR_REGISTRY",
+        str(_CONTENT_MEDIA_ROOT / "avatar_registry.py"),
+    )
+)
+_CONTENT_VIDEO_WORKER = os.getenv(
+    "CONTENT_VIDEO_WORKER",
+    str(_CONTENT_MEDIA_ROOT / "content_video_pipeline.py"),
+)
+_CONTENT_IMAGE_WORKER = os.getenv(
+    "CONTENT_IMAGE_WORKER",
+    str(_CONTENT_MEDIA_ROOT / "content_image_pipeline.py"),
+)
+_CONTENT_MEDIA_APPROVAL_WORKER = os.getenv(
+    "CONTENT_MEDIA_APPROVAL_WORKER",
+    str(_CONTENT_MEDIA_ROOT / "content_media_approval.py"),
+)
+_CONTENT_MEDIA_VIDEO_COMMANDS = ("#video", "#video-audio")
+_CONTENT_MEDIA_IMAGE_COMMANDS = ("#imagem", "#thumb", "#cinema")
+_CONTENT_MEDIA_LIST_COMMAND = "#avatares"
+_CONTENT_MEDIA_DECISION_PREFIXES = (
+    "sim",
+    "aprovado",
+    "bom",
+    "ok",
+    "ta bom",
+    "tá bom",
+    "nao",
+    "não",
+    "arquiva",
+    "descarta",
+    "lixo",
+    "outra",
+    "outra versao",
+    "outra versão",
+    "mais uma",
+    "regera",
+    "regenera",
+    "muda",
+    "ajusta",
+)
+_CONTENT_MEDIA_ALIAS_HINTS = {
+    "carro",
+    "daiane",
+    "formal",
+    "terno",
+    "qualquer",
+    "escritorio",
+    "vinicius1",
+    "vinicius2",
+}
 
 
 def _kill_port_process(port: int) -> None:
@@ -156,10 +251,10 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
     sig = signal.SIGTERM if not force else signal.SIGKILL
     os.killpg(os.getpgid(proc.pid), sig)
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms._custom.compat import ensure_media_dispatch_pool
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -294,15 +389,62 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if raw is None:
             return set()
         if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+            values = raw
+        else:
+            values = str(raw).split(",")
+        return {
+            normalized
+            for part in values
+            if (normalized := WhatsAppAdapter._normalize_allowlist_identifier(str(part)))
+        }
+
+    @staticmethod
+    def _normalize_allowlist_identifier(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        normalized = str(value).strip()
+        if normalized == "*":
+            return normalized
+        normalized = re.sub(r":.*@", "@", normalized)
+        normalized = re.sub(r"@.*", "", normalized)
+        return normalized.lstrip("+")
+
+    def _read_lid_mapping(self, identifier: str, suffix: str = "") -> Optional[str]:
+        file_path = self._session_path / f"lid-mapping-{identifier}{suffix}.json"
+        if not file_path.exists():
+            return None
+        try:
+            mapped = json.loads(file_path.read_text())
+        except Exception:
+            return None
+        return self._normalize_allowlist_identifier(mapped)
+
+    def _expand_allowlist_identifiers(self, identifier: str) -> set[str]:
+        normalized = self._normalize_allowlist_identifier(identifier)
+        if not normalized:
+            return set()
+
+        resolved: set[str] = set()
+        queue = [normalized]
+        while queue:
+            current = queue.pop(0)
+            if not current or current in resolved:
+                continue
+            resolved.add(current)
+            for suffix in ("", "_reverse"):
+                mapped = self._read_lid_mapping(current, suffix)
+                if mapped and mapped not in resolved:
+                    queue.append(mapped)
+        return resolved
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         """Check whether a DM from the given sender should be processed."""
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
-            return sender_id in self._allow_from
+            if "*" in self._allow_from:
+                return True
+            return bool(self._expand_allowlist_identifiers(sender_id) & self._allow_from)
         # "open" — all DMs allowed
         return True
 
@@ -773,6 +915,906 @@ class WhatsAppAdapter(BasePlatformAdapter):
             result = result.replace(f"{_CODE_PH}{i}\x00", code)
 
         return result
+
+    @staticmethod
+    def _strip_accents_for_command(value: str) -> str:
+        import unicodedata
+
+        normalized = unicodedata.normalize("NFKD", value or "")
+        return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+    def _parse_thumbnail_shortcut(self, event: MessageEvent) -> tuple[str, str, str] | None:
+        text = (event.text or "").strip()
+        if not text:
+            return None
+
+        normalized = self._strip_accents_for_command(text).lower().strip()
+        normalized = re.sub(r"^\s*hermes[,:\-\s]+", "", normalized)
+        thumb_word = r"(?:thumb(?:nail)?|tambine\w*)"
+        command_prefix = r"(?:(?:gera(?:r)?|cria(?:r)?|crie|faz(?:er)?|faca)\s+(?:uma?\s+)?)?"
+        person_word = r"(daiane|vinicius|vini)"
+        match = re.match(
+            command_prefix + thumb_word + r"\s+(?:(?:do|da|de)\s+)?" + person_word
+            + r"\b(?:\s*(?:para|pra|dessa|desta|da|de)?\s*)?(.*)$",
+            normalized,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            match = re.search(
+                thumb_word + r"\s+(?:(?:do|da|de)\s+)?" + person_word
+                + r"\b(?:\s*(?:para|pra|dessa|desta|da|de)?\s*)?(.*)$",
+                normalized,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        if not match:
+            return None
+
+        person = "vinicius" if match.group(1) in {"vinicius", "vini"} else "daiane"
+        original = re.sub(r"^\s*hermes[,:\-\s]+", "", text, flags=re.IGNORECASE)
+        original_norm = self._strip_accents_for_command(original).lower()
+        original_match = re.search(
+            thumb_word + r"\s+(?:(?:do|da|de)\s+)?(?:daiane|vinicius|vini)\b"
+            + r"(?:\s*(?:para|pra|dessa|desta|da|de)?\s*)?(.*)$",
+            original_norm,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        legenda = (original[original_match.start(1):] if original_match else match.group(2)).strip()
+        legenda = re.sub(
+            r"^(?:essa|esta)?\s*legenda\s*:?\s*",
+            "",
+            legenda,
+            flags=re.IGNORECASE,
+        ).strip()
+        legenda = re.sub(
+            r"^(?:com\s+)?(?:essa|esta)?\s*foto\s*:?\s*",
+            "",
+            legenda,
+            flags=re.IGNORECASE,
+        ).strip()
+        provider = "auto"
+        normalized_legenda = self._strip_accents_for_command(legenda).lower()
+        provider_match = re.search(
+            r"\b(?:usar|usa|com|no|na|via)\s+(openai|gpt|chatgpt|gemini)\b",
+            normalized_legenda,
+        )
+        if provider_match:
+            raw_provider = provider_match.group(1)
+            provider = "openai" if raw_provider in {"openai", "gpt", "chatgpt"} else "gemini"
+            legenda = re.sub(
+                r"\b(?:usar|usa|com|no|na|via)\s+(?:openai|gpt|chatgpt|gemini)\b",
+                "",
+                legenda,
+                flags=re.IGNORECASE,
+            ).strip(" :,-")
+        return person, legenda, provider
+
+    def _thumbnail_reference_context(self, event: MessageEvent, person: str) -> str:
+        media_urls = event.media_urls or []
+        media_types = event.media_types or []
+        image_refs = [
+            str(url)
+            for idx, url in enumerate(media_urls)
+            if str(media_types[idx] if idx < len(media_types) else "").startswith("image/")
+            or str(url).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+        ]
+        if not image_refs:
+            return ""
+        if person == "vinicius":
+            return f"using the attached face/body reference image: {image_refs[0]}"
+        return f"using the attached visual reference image: {image_refs[0]}"
+
+    @staticmethod
+    def _content_capture_sender_aliases(value: Optional[str]) -> set[str]:
+        if not value:
+            return set()
+        raw = str(value).strip().lower()
+        aliases = {raw}
+        if ":" in raw and "@" in raw:
+            aliases.add(raw.replace(":", "@", 1))
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            aliases.update(
+                {
+                    digits,
+                    f"+{digits}",
+                    f"{digits}@s.whatsapp.net",
+                    f"{digits}@c.us",
+                    f"{digits}@lid",
+                }
+            )
+        return {alias for alias in aliases if alias}
+
+    def _content_capture_sender_allowed(self, sender_id: Optional[str]) -> bool:
+        configured = os.getenv("CONTENT_CAPTURE_ALLOWED_SENDERS", "").strip()
+        allowed = (
+            [part.strip() for part in configured.split(",") if part.strip()]
+            if configured
+            else list(_CONTENT_CAPTURE_ALLOWED_SENDERS)
+        )
+        sender_aliases = self._content_capture_sender_aliases(sender_id)
+        if not sender_aliases:
+            return False
+        for candidate in allowed:
+            if sender_aliases & self._content_capture_sender_aliases(candidate):
+                return True
+        return False
+
+    @staticmethod
+    def _find_content_capture_trigger(text: str) -> Optional[str]:
+        haystack = (text or "").casefold()
+        if not haystack:
+            return None
+        for trigger in _CONTENT_CAPTURE_TRIGGERS:
+            if trigger.casefold() in haystack:
+                return trigger
+        return None
+
+    @staticmethod
+    def _extract_content_capture_audio(event: MessageEvent) -> Dict[str, Any]:
+        media_urls = event.media_urls or []
+        media_types = event.media_types or []
+        for idx, url in enumerate(media_urls):
+            media_type = str(media_types[idx] if idx < len(media_types) else "")
+            url_str = str(url)
+            if event.message_type not in (MessageType.AUDIO, MessageType.VOICE) and not media_type.startswith("audio/"):
+                continue
+            if os.path.isabs(url_str):
+                return {"path": url_str, "mime_type": media_type or "audio/ogg"}
+            if url_str.startswith(("http://", "https://")):
+                return {"url": url_str, "mime_type": media_type or "audio/ogg"}
+        return {}
+
+    def _build_content_capture_payload(self, event: MessageEvent) -> Dict[str, Any]:
+        raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
+        payload: Dict[str, Any] = {
+            "source_message_id": event.message_id or raw_message.get("messageId"),
+            "sender_jid": event.source.user_id or raw_message.get("senderId") or raw_message.get("chatId"),
+            "text": event.text or raw_message.get("body") or "",
+            "chat_id": event.source.chat_id,
+        }
+        audio = self._extract_content_capture_audio(event)
+        if audio:
+            payload["audio"] = audio
+        return payload
+
+    async def _run_content_capture_worker(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            _CONTENT_CAPTURE_WORKER,
+            "--stdin-json",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                (stderr or stdout or b"worker_failed").decode("utf-8", errors="replace").strip()
+            )
+        output = stdout.decode("utf-8", errors="replace").strip()
+        if not output:
+            raise RuntimeError("worker_sem_saida")
+        return json.loads(output.splitlines()[-1])
+
+    @staticmethod
+    def _find_content_link_trigger(text: str) -> Optional[str]:
+        haystack = (text or "").casefold()
+        if not haystack:
+            return None
+        for trigger in _CONTENT_LINK_ANALYZER_TRIGGERS:
+            if trigger.casefold() in haystack:
+                return trigger
+        return None
+
+    @staticmethod
+    def _find_content_link_source_url(text: str) -> Optional[str]:
+        candidates = re.findall(r"https?://[^\s<>\"]+", text or "", flags=re.IGNORECASE)
+        for url in candidates:
+            lowered = url.lower()
+            if any(
+                host in lowered
+                for host in (
+                    "youtube.com/",
+                    "youtu.be/",
+                    "instagram.com/",
+                    "tiktok.com/",
+                    "vm.tiktok.com/",
+                )
+            ):
+                return url
+        return None
+
+    @staticmethod
+    def _is_content_link_followup(text: str) -> bool:
+        normalized = (text or "").strip().casefold()
+        return normalized in {value.casefold() for value in _CONTENT_LINK_ANALYZER_FOLLOWUPS}
+
+    async def _run_content_link_worker(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            _CONTENT_LINK_ANALYZER_WORKER,
+            "--stdin-json",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                (stderr or stdout or b"worker_failed").decode("utf-8", errors="replace").strip()
+            )
+        output = stdout.decode("utf-8", errors="replace").strip()
+        if not output:
+            raise RuntimeError("worker_sem_saida")
+        return json.loads(output.splitlines()[-1])
+
+    async def _handle_content_link_shortcut(self, event: MessageEvent) -> bool:
+        if getattr(event.source, "chat_type", "") != "dm":
+            return False
+        sender_id = event.source.user_id or (
+            event.raw_message.get("senderId") if isinstance(event.raw_message, dict) else None
+        )
+        if not self._content_capture_sender_allowed(sender_id):
+            return False
+
+        payload = self._build_content_capture_payload(event)
+        text = str(payload.get("text") or "")
+        trigger = self._find_content_link_trigger(text)
+        source_url = self._find_content_link_source_url(text)
+        if not ((trigger and source_url) or self._is_content_link_followup(text)):
+            return False
+
+        try:
+            result = await self._run_content_link_worker(payload)
+        except Exception as exc:
+            logger.exception("[%s] content link shortcut failed: %s", self.name, exc)
+            await self.send(
+                event.source.chat_id,
+                "Nao consegui analisar esse video agora. Tenta de novo com outro link ou me chama depois.",
+                reply_to=event.message_id,
+            )
+            return True
+
+        if result.get("status") == "ignored":
+            return False
+
+        status = str(result.get("status") or "").strip().lower()
+        theme = result.get("theme") or "Video para revisar"
+
+        if status == "too_long":
+            duration = result.get("duration_seconds") or "?"
+            limit = result.get("max_video_seconds") or 300
+            confirmation = (
+                f"Esse video tem {duration}s e passou do limite de {limit}s.\n"
+                "Me manda uma versao de ate 5 minutos que eu analiso e transformo."
+            )
+        elif status == "scripted":
+            script_path = result.get("script_path") or "roteiros/"
+            confirmation = (
+                "Roteiro inspirado pronto.\n"
+                f"Tema: {theme}\n"
+                f"Caminho: {script_path}"
+            )
+        elif status == "banked":
+            confirmation = (
+                "Fechado. Guardei esse video no banco de ideias.\n"
+                f"Tema: {theme}"
+            )
+        elif status == "needs_review" and result.get("warning") == "download_failed_fallback_phase1":
+            confirmation = (
+                "Nao consegui baixar o audio do video, mas guardei titulo e descricao no banco para revisao manual.\n"
+                f"Tema salvo: {theme}"
+            )
+        else:
+            eixo = result.get("eixo") or "revisar eixo"
+            duration = result.get("duration_seconds") or result.get("duracao_seg") or "?"
+            confirmation = (
+                f"Video {duration}s analisado.\n"
+                f"Eixo: {eixo}\n\n"
+                "Quer que eu gere uma versao sua mantendo o mesmo eixo? Responde `gera` ou `so guarda`."
+            )
+
+        await self.send(
+            event.source.chat_id,
+            confirmation,
+            reply_to=event.message_id,
+        )
+        return True
+
+    async def _handle_content_capture_shortcut(self, event: MessageEvent) -> bool:
+        if getattr(event.source, "chat_type", "") != "dm":
+            return False
+        sender_id = event.source.user_id or (
+            event.raw_message.get("senderId") if isinstance(event.raw_message, dict) else None
+        )
+        if not self._content_capture_sender_allowed(sender_id):
+            return False
+
+        payload = self._build_content_capture_payload(event)
+        try:
+            result = await self._run_content_capture_worker(payload)
+        except Exception as exc:
+            logger.exception("[%s] content capture shortcut failed: %s", self.name, exc)
+            await self.send(
+                event.source.chat_id,
+                "Nao consegui salvar essa ideia agora. Tenta de novo em texto ou me chama depois.",
+                reply_to=event.message_id,
+            )
+            return True
+
+        if result.get("status") == "ignored":
+            return False
+
+        status = str(result.get("status") or "").strip().lower()
+        theme = result.get("theme") or "Ideia capturada para revisar"
+        hook = result.get("hook") or "Revisar manualmente"
+
+        if status == "scripted":
+            script_path = result.get("script_path") or "roteiros/"
+            confirmation = (
+                "Roteiro gerado.\n"
+                f"Tema: {theme}\n"
+                f"Caminho: {script_path}"
+            )
+        elif result.get("vini_decision") == "banked":
+            confirmation = (
+                "Fechado. Deixei essa ideia no banco.\n"
+                f"Tema: {theme}"
+            )
+        else:
+            confirmation = (
+                "Ideia salva.\n"
+                f"Tema sugerido: {theme}\n"
+                f"Hook: {hook}\n\n"
+                "Quer que eu transforme em roteiro agora ou deixo no banco?"
+            )
+        await self.send(
+            event.source.chat_id,
+            confirmation,
+            reply_to=event.message_id,
+        )
+        return True
+
+    def _load_content_media_avatar_module(self):
+        module_path = _CONTENT_MEDIA_AVATAR_REGISTRY
+        cached = getattr(self, "_content_media_avatar_module", None)
+        cached_path = getattr(self, "_content_media_avatar_module_path", "")
+        if cached is not None and cached_path == str(module_path):
+            return cached
+        if not module_path.is_file():
+            raise FileNotFoundError(f"avatar_registry ausente em {module_path}")
+        spec = importlib.util.spec_from_file_location("hermes_content_avatar_registry", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"nao foi possivel carregar avatar_registry de {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        self._content_media_avatar_module = module
+        self._content_media_avatar_module_path = str(module_path)
+        return module
+
+    @staticmethod
+    def _split_content_media_command(text: str) -> tuple[str, str]:
+        normalized = (text or "").strip()
+        if not normalized:
+            return "", ""
+        parts = normalized.split(maxsplit=1)
+        command = parts[0].casefold()
+        remainder = parts[1].strip() if len(parts) > 1 else ""
+        return command, remainder
+
+    @staticmethod
+    def _looks_like_content_media_alias(token: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(token or "").casefold())
+        if not normalized:
+            return False
+        if normalized in _CONTENT_MEDIA_ALIAS_HINTS:
+            return True
+        if normalized.startswith(("vinicius", "escritorio")):
+            return True
+        return "-" in normalized or "_" in normalized
+
+    def _parse_content_media_avatar(
+        self,
+        token: str | None,
+        *,
+        registry: Any,
+        avatar_module: Any,
+    ):
+        normalized = str(token or "").strip().casefold() or None
+        if normalized and normalized not in registry.aliases and normalized not in registry.groups:
+            raise avatar_module.AvatarAliasError(normalized, registry)
+        return avatar_module.resolve_alias_details(
+            normalized,
+            config_path=registry.source_path,
+            registry=registry,
+        )
+
+    def _parse_content_media_video_request(self, text: str) -> dict[str, Any]:
+        avatar_module = self._load_content_media_avatar_module()
+        registry = avatar_module.load_avatar_registry()
+        command, remainder = self._split_content_media_command(text)
+        if command not in _CONTENT_MEDIA_VIDEO_COMMANDS:
+            raise ValueError("unsupported_video_command")
+
+        alias_token = None
+        prompt = remainder
+        if remainder:
+            first_token, _, rest = remainder.partition(" ")
+            normalized_first = first_token.strip().casefold()
+            if normalized_first in registry.aliases or normalized_first in registry.groups:
+                alias_token = normalized_first
+                prompt = rest.strip()
+            elif command == "#video" and self._looks_like_content_media_alias(normalized_first):
+                raise avatar_module.AvatarAliasError(normalized_first, registry)
+            elif command == "#video-audio" and self._looks_like_content_media_alias(normalized_first):
+                raise avatar_module.AvatarAliasError(normalized_first, registry)
+
+        resolution = self._parse_content_media_avatar(
+            alias_token,
+            registry=registry,
+            avatar_module=avatar_module,
+        )
+
+        if command == "#video":
+            prompt = prompt.strip()
+            if not prompt:
+                raise ValueError("missing_video_prompt")
+        else:
+            prompt = prompt.strip() or None
+
+        return {
+            "command": command,
+            "prompt": prompt,
+            "avatar_alias": resolution.resolved_alias,
+            "avatar_id": resolution.avatar_id,
+            "registry": registry,
+        }
+
+    @staticmethod
+    def _parse_content_media_image_request(text: str) -> dict[str, Any]:
+        command, remainder = WhatsAppAdapter._split_content_media_command(text)
+        prompt = remainder.strip()
+        if command not in _CONTENT_MEDIA_IMAGE_COMMANDS:
+            raise ValueError("unsupported_image_command")
+        if command == "#thumb":
+            first, _, rest = prompt.partition(" ")
+            if not first.strip() or not rest.strip():
+                raise ValueError("missing_thumb_prompt")
+        elif not prompt:
+            raise ValueError("missing_image_prompt")
+        return {
+            "command": command,
+            "prompt": prompt,
+        }
+
+    @staticmethod
+    def _extract_content_media_audio_source(event: MessageEvent) -> str | None:
+        audio = WhatsAppAdapter._extract_content_capture_audio(event)
+        return str(audio.get("path") or audio.get("url") or "").strip() or None
+
+    @staticmethod
+    def _content_media_worker_path(command: str) -> Path:
+        if command in _CONTENT_MEDIA_IMAGE_COMMANDS:
+            return Path(_CONTENT_IMAGE_WORKER)
+        return Path(_CONTENT_VIDEO_WORKER)
+
+    @staticmethod
+    def _content_media_approval_worker_path() -> Path:
+        return Path(_CONTENT_MEDIA_APPROVAL_WORKER)
+
+    async def _enqueue_content_media_job(
+        self,
+        *,
+        job_type: str,
+        command: str,
+        prompt: str | None = None,
+        source_audio_url: str | None = None,
+        avatar_id: str | None = None,
+        avatar_alias: str | None = None,
+    ) -> str:
+        pool = await ensure_media_dispatch_pool(self)
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO content.media_jobs (
+                    type,
+                    command,
+                    prompt,
+                    source_audio_url,
+                    avatar_id,
+                    avatar_alias,
+                    status
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 'queued')
+                RETURNING id::text AS id
+                """,
+                job_type,
+                command,
+                prompt,
+                source_audio_url,
+                avatar_id,
+                avatar_alias,
+            )
+        return str(row["id"])
+
+    async def _run_content_media_worker(self, worker_path: Path, *, command: str, job_id: str) -> None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(worker_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[%s] content media worker start failed command=%s job_id=%s err=%s",
+                self.name,
+                command,
+                job_id,
+                exc,
+            )
+            return
+
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            detail = (stderr or stdout or b"worker_failed").decode("utf-8", errors="replace").strip()
+            logger.error(
+                "[%s] content media worker failed command=%s job_id=%s detail=%s",
+                self.name,
+                command,
+                job_id,
+                detail[:500],
+            )
+            return
+
+        output = stdout.decode("utf-8", errors="replace").strip()
+        logger.info(
+            "[%s] content media worker finished command=%s job_id=%s output=%s",
+            self.name,
+            command,
+            job_id,
+            output.splitlines()[-1] if output else "ok",
+        )
+        await self._send_content_media_preview(job_id=job_id)
+
+    def _launch_content_media_worker(self, command: str, *, job_id: str) -> None:
+        worker_path = self._content_media_worker_path(command)
+        asyncio.create_task(self._run_content_media_worker(worker_path, command=command, job_id=job_id))
+
+    async def _run_content_media_approval_cli(self, *args: str) -> dict[str, Any]:
+        worker_path = self._content_media_approval_worker_path()
+        if not worker_path.is_file():
+            raise FileNotFoundError(f"approval worker ausente em {worker_path}")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(worker_path),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        raw_output = stdout.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            detail = (stderr or stdout or b"approval_failed").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(detail[:500])
+        if not raw_output:
+            return {}
+        try:
+            return json.loads(raw_output.splitlines()[-1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"approval_json_invalido:{raw_output[-500:]}") from exc
+
+    async def _send_content_media_preview(self, *, job_id: str) -> None:
+        try:
+            result = await self._run_content_media_approval_cli(
+                "--job-id",
+                job_id,
+                "--send-preview",
+            )
+            logger.info(
+                "[%s] content media preview sent job_id=%s status=%s",
+                self.name,
+                job_id,
+                result.get("status") or result.get("ok") or "sent",
+            )
+        except Exception as exc:
+            logger.exception("[%s] content media preview failed job_id=%s err=%s", self.name, job_id, exc)
+
+    @staticmethod
+    def _looks_like_content_media_decision(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip().casefold())
+        if not normalized:
+            return False
+        return any(
+            normalized == prefix or normalized.startswith(f"{prefix} ")
+            for prefix in _CONTENT_MEDIA_DECISION_PREFIXES
+        )
+
+    async def _handle_content_media_decision(self, event: MessageEvent) -> bool:
+        if getattr(event.source, "chat_type", "") != "dm":
+            return False
+        sender_id = event.source.user_id or (
+            event.raw_message.get("senderId") if isinstance(event.raw_message, dict) else None
+        )
+        if not self._content_capture_sender_allowed(sender_id):
+            return False
+        text = (event.text or "").strip()
+        if not self._looks_like_content_media_decision(text):
+            return False
+
+        try:
+            result = await self._run_content_media_approval_cli("--decision-text", text)
+        except FileNotFoundError:
+            logger.exception("[%s] content media approval worker missing", self.name)
+            return False
+        except Exception as exc:
+            logger.exception("[%s] content media decision failed: %s", self.name, exc)
+            await self.send(
+                event.source.chat_id,
+                "Nao consegui aplicar essa aprovacao agora. Vou deixar o job pendente para nao perder nada.",
+                reply_to=event.message_id,
+            )
+            return True
+
+        status = str(result.get("status") or "").strip().lower()
+        if status in {"ignored", "missing_job"}:
+            return False
+
+        new_job_id = result.get("new_job_id")
+        command = result.get("command")
+        if new_job_id and command:
+            self._launch_content_media_worker(str(command), job_id=str(new_job_id))
+
+        reply_text = str(result.get("reply_text") or "").strip()
+        if reply_text:
+            await self.send(event.source.chat_id, reply_text, reply_to=event.message_id)
+        return True
+
+    async def _send_content_media_aliases(self, event: MessageEvent) -> bool:
+        avatar_module = self._load_content_media_avatar_module()
+        registry = avatar_module.load_avatar_registry()
+        if hasattr(avatar_module, "format_available_aliases_message"):
+            message = avatar_module.format_available_aliases_message(registry)
+        else:
+            aliases = avatar_module.list_available_aliases(registry)
+            message = (
+                f"Avatar default: {registry.default_alias}\n"
+                f"Aliases: {', '.join(aliases.get('aliases') or [])}\n"
+                f"Grupos: {', '.join(aliases.get('groups') or []) or 'nenhum'}"
+            )
+        await self.send(
+            event.source.chat_id,
+            message,
+            reply_to=event.message_id,
+        )
+        return True
+
+    async def _handle_content_media_shortcut(self, event: MessageEvent) -> bool:
+        if getattr(event.source, "chat_type", "") != "dm":
+            return False
+        sender_id = event.source.user_id or (
+            event.raw_message.get("senderId") if isinstance(event.raw_message, dict) else None
+        )
+        if not self._content_capture_sender_allowed(sender_id):
+            return False
+
+        text = (event.text or "").strip()
+        command, _ = self._split_content_media_command(text)
+        if not command:
+            return False
+
+        if command == _CONTENT_MEDIA_LIST_COMMAND:
+            try:
+                return await self._send_content_media_aliases(event)
+            except Exception as exc:
+                logger.exception("[%s] content media aliases failed: %s", self.name, exc)
+                await self.send(
+                    event.source.chat_id,
+                    "Nao consegui listar os avatares agora. Tenta de novo em seguida.",
+                    reply_to=event.message_id,
+                )
+                return True
+
+        if command not in _CONTENT_MEDIA_VIDEO_COMMANDS and command not in _CONTENT_MEDIA_IMAGE_COMMANDS:
+            return False
+
+        try:
+            worker_path = self._content_media_worker_path(command)
+            if not worker_path.is_file():
+                raise FileNotFoundError(f"worker ausente em {worker_path}")
+
+            if command in _CONTENT_MEDIA_VIDEO_COMMANDS:
+                parsed = self._parse_content_media_video_request(text)
+                source_audio_url = None
+                if command == "#video-audio":
+                    source_audio_url = self._extract_content_media_audio_source(event)
+                    if not source_audio_url:
+                        raise ValueError("missing_video_audio_attachment")
+                job_id = await self._enqueue_content_media_job(
+                    job_type="video",
+                    command=command,
+                    prompt=parsed.get("prompt"),
+                    source_audio_url=source_audio_url,
+                    avatar_id=parsed.get("avatar_id"),
+                    avatar_alias=parsed.get("avatar_alias"),
+                )
+                confirmation = (
+                    f"Video enfileirado com avatar {parsed.get('avatar_alias')}."
+                    if command == "#video"
+                    else f"Video com audio enfileirado com avatar {parsed.get('avatar_alias')}."
+                )
+            else:
+                parsed = self._parse_content_media_image_request(text)
+                job_id = await self._enqueue_content_media_job(
+                    job_type="image",
+                    command=command,
+                    prompt=parsed.get("prompt"),
+                )
+                confirmation = f"{command.removeprefix('#').title()} enfileirada."
+
+            self._launch_content_media_worker(command, job_id=job_id)
+            await self.send(
+                event.source.chat_id,
+                f"{confirmation} Job {job_id[:8]}. Te aviso quando terminar.",
+                reply_to=event.message_id,
+            )
+            return True
+        except FileNotFoundError as exc:
+            logger.exception("[%s] content media runtime missing: %s", self.name, exc)
+            await self.send(
+                event.source.chat_id,
+                "Pipeline de midia ainda nao esta pronto no runtime. Me chama depois do deploy.",
+                reply_to=event.message_id,
+            )
+            return True
+        except Exception as exc:
+            avatar_module = None
+            try:
+                avatar_module = self._load_content_media_avatar_module()
+            except Exception:
+                avatar_module = None
+
+            message = "Nao consegui entender esse comando."
+            if avatar_module is not None and isinstance(exc, avatar_module.AvatarAliasError):
+                message = str(exc)
+            elif str(exc) == "missing_video_prompt":
+                message = "Usa assim: #video [avatar] seu texto aqui."
+            elif str(exc) == "missing_video_audio_attachment":
+                message = "Para #video-audio, anexa um audio e opcionalmente um avatar. Ex.: #video-audio carro"
+            elif str(exc) == "missing_image_prompt":
+                message = "Usa assim: #imagem seu prompt aqui ou #cinema seu prompt aqui."
+            elif str(exc) == "missing_thumb_prompt":
+                message = "Usa assim: #thumb PALAVRA seu prompt aqui."
+            else:
+                logger.exception("[%s] content media shortcut failed: %s", self.name, exc)
+
+            await self.send(
+                event.source.chat_id,
+                message,
+                reply_to=event.message_id,
+            )
+            return True
+
+    @staticmethod
+    def _format_thumbnail_response(person: str, result: dict[str, Any]) -> str:
+        if person == "vinicius":
+            return (
+                "Thumb Vinicius pronta.\n"
+                f"Formato: {result.get('aspect_ratio')} / {result.get('size')}\n"
+                f"Headline: {result.get('headline')}\n"
+                f"Palavra destaque: {result.get('gold_word')}\n\n"
+                "Prompt principal:\n"
+                f"```{result.get('prompt', '')}```\n\n"
+                "Alternativa:\n"
+                f"```{result.get('alternative_prompt', '')}```"
+            )
+
+        lines = [
+            "Thumb Daiane pronta.",
+            f"Formato: {result.get('aspect_ratio')} / {result.get('size')}",
+            f"Tema: {result.get('theme')}",
+            "",
+        ]
+        for variant in result.get("variants", [])[:3]:
+            lines.extend(
+                [
+                    f"{variant.get('id')} - bloco {variant.get('block_word')} ({variant.get('block_color')})",
+                    f"```{variant.get('prompt', '')}```",
+                    "",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    async def _handle_thumbnail_shortcut(self, event: MessageEvent) -> bool:
+        parsed = self._parse_thumbnail_shortcut(event)
+        if not parsed:
+            return False
+
+        person, legenda, provider = parsed
+        if not legenda:
+            await self.send(
+                event.source.chat_id,
+                f"Me manda a legenda junto. Exemplo: thumb {person.title()} para essa legenda: ...",
+                reply_to=event.message_id,
+            )
+            return True
+
+        try:
+            from gateway.platforms._custom.thumbnail_router import (
+                generate_daiane_thumbnail_prompt,
+                generate_thumbnail_prompt,
+            )
+            from gateway.platforms._custom.thumbnail_image_generator import (
+                generate_thumbnail_image,
+            )
+
+            reference_images = [
+                str(url)
+                for url in (event.media_urls or [])
+                if str(url).lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+            ]
+            payload = {
+                "legenda": legenda,
+                "reference_context": self._thumbnail_reference_context(event, person),
+            }
+            if person == "vinicius" and (event.media_urls or []):
+                payload["face_mode"] = "com_rosto"
+            result = (
+                generate_daiane_thumbnail_prompt(payload)
+                if person == "daiane"
+                else generate_thumbnail_prompt(payload)
+            )
+
+            progress = await self.send(
+                event.source.chat_id,
+                f"Gerando a thumb {person.title()} agora em 9:16. Se o provedor de imagem falhar, eu te mando o prompt pronto.",
+                reply_to=event.message_id,
+            )
+            image_result = await generate_thumbnail_image(
+                person=person,
+                legenda=legenda,
+                prompt_result=result,
+                reference_images=reference_images,
+                provider=provider,
+            )
+            caption = (
+                f"Thumb {person.title()} pronta.\n"
+                f"Provider: {image_result.get('provider')}\n"
+                "Formato: 9:16 / 1080x1920"
+            )
+            await self.send_image_file(
+                event.source.chat_id,
+                image_result["path"],
+                caption=caption,
+                reply_to=getattr(progress, "message_id", None) or event.message_id,
+            )
+        except Exception as exc:
+            logger.exception("[%s] thumbnail shortcut failed: %s", self.name, exc)
+            await self.send(
+                event.source.chat_id,
+                "Nao consegui gerar a imagem agora. Vou te mandar o prompt pronto para usar manualmente.\n\n"
+                + self._format_thumbnail_response(person, result if "result" in locals() else {"prompt": legenda}),
+                reply_to=event.message_id,
+            )
+        return True
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        if await self._handle_content_media_decision(event):
+            return
+        if await self._handle_content_media_shortcut(event):
+            return
+        if await self._handle_thumbnail_shortcut(event):
+            return
+        if await self._handle_content_link_shortcut(event):
+            return
+        if await self._handle_content_capture_shortcut(event):
+            return
+        await super().handle_message(event)
 
     async def send(
         self,

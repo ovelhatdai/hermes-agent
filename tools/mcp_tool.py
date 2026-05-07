@@ -1268,6 +1268,14 @@ class MCPServerTask:
 
         url = config["url"]
         headers = dict(config.get("headers") or {})
+        auth_config = config.get("auth")
+        if isinstance(auth_config, dict):
+            token = (auth_config.get("bearer_token") or "").strip()
+            token_env = (auth_config.get("bearer_token_env") or "").strip()
+            if not token and token_env:
+                token = (os.getenv(token_env) or "").strip()
+            if token and not any(key.lower() == "authorization" for key in headers):
+                headers["Authorization"] = f"Bearer {token}"
         # Some MCP servers require MCP-Protocol-Version on the initial
         # initialize request and reject session-less POSTs otherwise.
         # Seed it as a client-level default, but treat user overrides as
@@ -1432,7 +1440,16 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
-        self._auth_type = (config.get("auth") or "").lower().strip()
+        auth_config = config.get("auth") or ""
+        if isinstance(auth_config, dict):
+            self._auth_type = str(
+                auth_config.get("type")
+                or auth_config.get("mode")
+                or auth_config.get("scheme")
+                or ("bearer" if auth_config.get("bearer_token_env") or auth_config.get("bearer_token") else "")
+            ).lower().strip()
+        else:
+            self._auth_type = str(auth_config).lower().strip()
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
