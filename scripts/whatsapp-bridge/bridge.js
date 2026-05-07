@@ -622,6 +622,7 @@ async function startSocket() {
         mediaUrls,
         mentionedIds,
         quotedParticipant,
+        quotedText: extractQuotedText(messageContent),
         botIds,
         timestamp: msg.messageTimestamp,
       };
