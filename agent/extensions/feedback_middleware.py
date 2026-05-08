@@ -102,12 +102,15 @@ async def detect_emoji_feedback(message_text: str | None, sender_jid: str | None
     sender_jid = _normalize_jid(sender_jid)
     if not _is_covered_dm(sender_jid):
         return None
-    if not quoted_text:
-        return None
-    match = HASH_RE.search(quoted_text)
-    if not match:
-        return None
     text = message_text or ""
+    match = HASH_RE.search(quoted_text or "")
+    if not match:
+        inline_match = HASH_RE.search(text)
+        if not inline_match:
+            inline_match = re.search(r"(?:#|jogo da velha\s+)([A-Za-z0-9_-]{4,8})", text, re.IGNORECASE)
+        if not inline_match:
+            return None
+        match = inline_match
     rating = None
     if any(mark in text for mark in POSITIVE):
         rating = "positive"
@@ -119,7 +122,7 @@ async def detect_emoji_feedback(message_text: str | None, sender_jid: str | None
         "hash": match.group(1),
         "rating": rating,
         "user_jid": sender_jid,
-        "context": {"quoted_excerpt": quoted_text[:200]},
+        "context": {"quoted_excerpt": (quoted_text or text)[:200]},
     }
 
 
