@@ -173,9 +173,21 @@ function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
   return chunks;
 }
 
+function rememberSentFeedbackHash(sent, message) {
+  const id = sent?.key?.id;
+  if (!id) return;
+  const match = String(message || '').match(/\[#([A-Za-z0-9_-]{4,8})\]/);
+  if (!match) return;
+  sentFeedbackHashes.set(id, match[1]);
+  if (sentFeedbackHashes.size > MAX_RECENT_IDS) {
+    sentFeedbackHashes.delete(sentFeedbackHashes.keys().next().value);
+  }
+}
+
 function trackSentMessageId(sent) {
   if (sent?.key?.id) {
     recentlySentIds.add(sent.key.id);
+    rememberSentFeedbackHash(sent, message);
     if (recentlySentIds.size > MAX_RECENT_IDS) {
       recentlySentIds.delete(recentlySentIds.values().next().value);
     }
@@ -294,6 +306,7 @@ const MAX_QUEUE_SIZE = 100;
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
+const sentFeedbackHashes = new Map();
 const MAX_RECENT_IDS = 50;
 
 let sock = null;
@@ -486,7 +499,8 @@ async function startSocket() {
       const messageContent = getMessageContent(msg);
       const contextInfo = getContextInfo(messageContent);
       const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
-      const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || contextInfo?.remoteJid || '');
+      let quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || contextInfo?.remoteJid || '');
+      let quotedText = extractQuotedText(messageContent);
 
       // Extract message body
       let body = '';
@@ -494,7 +508,15 @@ async function startSocket() {
       let mediaType = '';
       const mediaUrls = [];
 
-      if (messageContent.conversation) {
+      const reaction = messageContent.reactionMessage;
+      if (reaction) {
+        body = reaction.text || '';
+        quotedParticipant = normalizeWhatsAppId(reaction.key?.participant || reaction.key?.remoteJid || quotedParticipant);
+        const reactedHash = sentFeedbackHashes.get(reaction.key?.id);
+        if (reactedHash && !quotedText) {
+          quotedText = `[#${reactedHash}]`;
+        }
+      } else if (messageContent.conversation) {
         body = messageContent.conversation;
       } else if (messageContent.extendedTextMessage?.text) {
         body = messageContent.extendedTextMessage.text;
@@ -590,7 +612,7 @@ async function startSocket() {
         const acked = await chipManagerBridge.maybeAckIncomingAlert({
           chatId,
           text: body,
-          quotedText: extractQuotedText(messageContent),
+          quotedText,
           senderPhone: senderNumber,
         });
         if (acked) {
@@ -622,7 +644,7 @@ async function startSocket() {
         mediaUrls,
         mentionedIds,
         quotedParticipant,
-        quotedText: extractQuotedText(messageContent),
+        quotedText,
         botIds,
         timestamp: msg.messageTimestamp,
       };
@@ -654,6 +676,7 @@ async function sendTextMessage(chatId, message) {
 
   if (sent?.key?.id) {
     recentlySentIds.add(sent.key.id);
+    rememberSentFeedbackHash(sent, message);
     if (recentlySentIds.size > MAX_RECENT_IDS) {
       recentlySentIds.delete(recentlySentIds.values().next().value);
     }
