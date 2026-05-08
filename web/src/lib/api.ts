@@ -85,6 +85,8 @@ export const api = {
   },
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
+  getLearningDashboard: (range: string) =>
+    fetchJSON<LearningDashboardResponse>(`/api/dashboard/learning?range=${encodeURIComponent(range)}`),
   getModelsAnalytics: (days: number) =>
     fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
@@ -811,4 +813,39 @@ export interface AgentPluginUpdateResponse {
 export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
+}
+
+
+export interface LearningUsageEntry {
+  feature: string;
+  name: string;
+  uses: number;
+  successes: number;
+  avg_latency_ms: number | null;
+  last_used: string | null;
+}
+
+export interface LearningFeedbackEntry {
+  hash: string;
+  count: number;
+  users?: string;
+  last_seen?: string | null;
+}
+
+export interface LearningDriftEntry {
+  feature: string;
+  name: string;
+  prev_uses: number;
+  current_uses: number;
+  retention_pct: number;
+}
+
+export interface LearningDashboardResponse {
+  range: string;
+  top_skills: LearningUsageEntry[];
+  top_positive: LearningFeedbackEntry[];
+  top_negative: LearningFeedbackEntry[];
+  drift_alerts: LearningDriftEntry[];
+  usage_total: number;
+  feedback_coverage_7d: number;
 }
