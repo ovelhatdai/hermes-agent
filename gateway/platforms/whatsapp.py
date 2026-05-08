@@ -1803,19 +1803,21 @@ class WhatsAppAdapter(BasePlatformAdapter):
             )
         return True
 
-    async def _maybe_record_feedback_reaction(self, event: MessageEvent) -> None:
+    async def _maybe_record_feedback_reaction(self, event: MessageEvent) -> bool:
         try:
             from agent.extensions.feedback_middleware import detect_emoji_feedback, post_feedback
             raw = event.raw_message if isinstance(event.raw_message, dict) else {}
             sender_id = event.source.user_id or raw.get("senderId") or raw.get("chatId")
             payload = await detect_emoji_feedback(event.text, sender_id, raw.get("quotedText"))
             if payload:
-                await post_feedback(payload)
+                return await post_feedback(payload)
         except Exception as exc:
             logger.warning("[%s] feedback reaction detection failed: %s", self.name, exc)
+        return False
 
     async def handle_message(self, event: MessageEvent) -> None:
-        await self._maybe_record_feedback_reaction(event)
+        if await self._maybe_record_feedback_reaction(event):
+            return
         if await self._handle_content_media_decision(event):
             return
         if await self._handle_content_media_shortcut(event):
