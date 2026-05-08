@@ -2795,6 +2795,82 @@ async def update_config_raw(body: RawConfigUpdate):
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 
 
+
+
+@app.get("/api/dashboard/learning")
+async def get_learning_dashboard(range: str = "30d"):
+    """SPEC-146 task 07: learning dashboard data from Hermes feedback/usage tables."""
+    range_days = {"7d": 7, "30d": 30, "90d": 90}.get(range, 30)
+    try:
+        import asyncpg
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="asyncpg_unavailable") from exc
+
+    db_url = (
+        os.getenv("HERMES_FEEDBACK_DATABASE_URL")
+        or os.getenv("HERMES_DB_URL")
+        or "postgresql://postgres@127.0.0.1:5432/hermes"
+    )
+    try:
+        conn = await asyncpg.connect(db_url, timeout=5)
+        try:
+            top_skills = await conn.fetch(
+                """
+                SELECT feature, name, uses::int, COALESCE(successes, 0)::int AS successes,
+                       avg_latency_ms::int, last_used::text AS last_used
+                FROM hermes.v_usage_top_30d
+                ORDER BY uses DESC
+                LIMIT 10
+                """
+            )
+            top_positive = await conn.fetch(
+                """
+                SELECT hash, count::int AS count, users::text AS users, last_seen::text AS last_seen
+                FROM hermes.v_feedback_summary_30d
+                WHERE rating='positive'
+                ORDER BY count DESC, last_seen DESC
+                LIMIT 10
+                """
+            )
+            top_negative = await conn.fetch(
+                """
+                SELECT hash, count::int AS count, users::text AS users, last_seen::text AS last_seen
+                FROM hermes.v_feedback_summary_30d
+                WHERE rating='negative'
+                ORDER BY count DESC, last_seen DESC
+                LIMIT 10
+                """
+            )
+            drift_alerts = await conn.fetch(
+                """
+                SELECT feature, name, prev_uses::int, current_uses::int, retention_pct::float
+                FROM hermes.v_usage_drift
+                LIMIT 10
+                """
+            )
+            usage_total = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM hermes.usage_tracking WHERE created_at > now() - ($1::int * interval '1 day')",
+                range_days,
+            )
+            feedback_coverage_7d = await conn.fetchval(
+                "SELECT COUNT(DISTINCT hash)::int FROM hermes.feedback WHERE created_at > now() - interval '7 days'"
+            )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"learning_dashboard_failed: {exc}") from exc
+
+    return {
+        "range": range,
+        "top_skills": [dict(r) for r in top_skills],
+        "top_positive": [dict(r) for r in top_positive],
+        "top_negative": [dict(r) for r in top_negative],
+        "drift_alerts": [dict(r) for r in drift_alerts],
+        "usage_total": usage_total or 0,
+        "feedback_coverage_7d": feedback_coverage_7d or 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Token / cost analytics endpoint
 # ---------------------------------------------------------------------------
