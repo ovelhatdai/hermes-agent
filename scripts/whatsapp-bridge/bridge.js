@@ -455,12 +455,17 @@ async function startSocket() {
           const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
           const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
           const isMentioned = mentions.some(m => (myNumber && m === myNumber) || (myLid && m === myLid));
+          const groupBody = extractPlainText(messageContent_).trim();
+          const isAllowedEmailCommand = ALLOWED_GROUPS.has(chatId) && /^#emails?$/i.test(groupBody);
 
-          if (!isMentioned) {
+          if (!isMentioned && !isAllowedEmailCommand) {
             if (WHATSAPP_DEBUG) console.log(`[GROUP-SKIP] No @mention, ignoring group msg from ${senderNumber} in ${chatId}`);
             continue;
           }
-          if (WHATSAPP_DEBUG) console.log(`[GROUP-MENTION] @mentioned in group ${chatId} by ${senderNumber}, processing`);
+          if (WHATSAPP_DEBUG) {
+            const reason = isAllowedEmailCommand ? 'allowed #email command' : '@mentioned';
+            console.log(`[GROUP-MENTION] ${reason} in group ${chatId} by ${senderNumber}, processing`);
+          }
         }
 
         // SPEC-060: se WHATSAPP_ALLOWED_GROUPS estiver definida, so libera grupos listados.
@@ -621,7 +626,7 @@ async function startSocket() {
       }
 
       // SPEC-060: injeta diretriz de tradutor se no grupo configurado + regex bate
-      if (isGroup && ALLOWED_GROUPS.has(chatId)) {
+      if (isGroup && TRANSLATOR_GROUP && chatId === TRANSLATOR_GROUP && TRANSLATOR_REGEX.test(body)) {
         const rows = await fetchGroupHistory(chatId);
         const history = formatGroupContextRows(rows);
         const historyBlock = history

@@ -10,11 +10,14 @@ Usage:
 """
 
 import asyncio
+import base64
+import hashlib
 import hmac
 import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -22,10 +25,16 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+
+try:
+    import bcrypt
+except ImportError:  # pragma: no cover - startup env issue, handled at auth time
+    bcrypt = None  # type: ignore[assignment]
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,6 +57,8 @@ from hermes_cli.config import (
     redact_key,
 )
 from gateway.status import get_running_pid, read_runtime_status
+from hermes_cli.mentee_cache import cache_get, cache_set_background, snapshot_cache_ttl
+from hermes_cli.mentee_snapshot import aggregate_snapshot
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -63,6 +74,7 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+_auth_log = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Hermes Agent", version=__version__)
 
@@ -109,6 +121,13 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/plugins/rescan",
 })
 
+MENTEE_API_PREFIX = "/api/mentee/"
+MENTORHUB_DEFAULT_CORS_ORIGIN = "https://app.base44.com"
+OAB_RE = re.compile(r"^\d{1,6}$")
+MONGO_ID_RE = re.compile(r"^[a-f0-9]{24}$")
+_mentee_pg_pool: Any | None = None
+_mentorhub_bearer_auth_cache: dict[tuple[str, str], float] = {}
+
 
 def _has_valid_session_token(request: Request) -> bool:
     """True if the request carries a valid dashboard session token.
@@ -134,6 +153,111 @@ def _require_token(request: Request) -> None:
     """Validate the ephemeral session token.  Raises 401 on mismatch."""
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _mentorhub_cors_origins() -> set[str]:
+    raw = os.environ.get("MENTORHUB_CORS_ORIGINS", MENTORHUB_DEFAULT_CORS_ORIGIN)
+    origins = {origin.strip() for origin in raw.split(",") if origin.strip()}
+    return origins or {MENTORHUB_DEFAULT_CORS_ORIGIN}
+
+
+def _mentee_cors_headers(origin: str | None) -> Dict[str, str]:
+    if not origin or origin not in _mentorhub_cors_origins():
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Vary": "Origin",
+    }
+
+
+def _mask_auth_header(auth_header: str) -> str:
+    auth_header = (auth_header or "").strip()
+    if not auth_header:
+        return "(empty)"
+    if len(auth_header) <= 8:
+        return "(too_short)"
+    return f"{auth_header[:8]}***"
+
+
+def _check_bcrypt(secret: str, expected_hash: str) -> bool:
+    if bcrypt is None:
+        _auth_log.error("[AUTH-BCRYPT-MISSING]")
+        return False
+    try:
+        return bool(bcrypt.checkpw(secret.encode(), expected_hash.encode()))
+    except Exception as exc:
+        _auth_log.warning("[AUTH-BCRYPT-ERR] error=%s", type(exc).__name__)
+        return False
+
+
+def _validate_mentee_bearer(token: str) -> bool:
+    expected_hash = os.environ.get("MENTORHUB_HERMES_TOKEN_HASH", "")
+    if not expected_hash:
+        _auth_log.error("[AUTH-BEARER-MISSING-HASH]")
+        return False
+    token_digest = hashlib.sha256(token.encode()).hexdigest()
+    cache_key = (token_digest, expected_hash)
+    now = time.monotonic()
+    cached_until = _mentorhub_bearer_auth_cache.get(cache_key)
+    if cached_until and cached_until > now:
+        return True
+
+    is_valid = _check_bcrypt(token, expected_hash)
+    if is_valid:
+        if len(_mentorhub_bearer_auth_cache) > 128:
+            expired = [key for key, expires_at in _mentorhub_bearer_auth_cache.items() if expires_at <= now]
+            for key in expired:
+                _mentorhub_bearer_auth_cache.pop(key, None)
+        auth_cache_ttl = int(os.environ.get("MENTORHUB_AUTH_CACHE_TTL_SECONDS", "60"))
+        _mentorhub_bearer_auth_cache[cache_key] = now + max(1, auth_cache_ttl)
+    return is_valid
+
+
+def _normalize_bcrypt_hash(raw_hash: str) -> str:
+    return raw_hash.replace("$$", "$")
+
+
+def _dashboard_basic_hash_for_user(user: str) -> str:
+    raw_hash = os.environ.get("HERMES_DASHBOARD_PASS_HASH", "") or os.environ.get("HERMES_DASHBOARD_HASH", "")
+    if not raw_hash:
+        return ""
+    normalized_hash = _normalize_bcrypt_hash(raw_hash)
+    if normalized_hash.startswith("$2"):
+        return normalized_hash
+    if ":" in normalized_hash:
+        hash_user, hash_value = normalized_hash.split(":", 1)
+        if hash_value.startswith("$2") and hmac.compare_digest(hash_user.encode(), user.encode()):
+            return hash_value
+    return ""
+
+
+def _validate_dashboard_basic(user: str, password: str) -> bool:
+    expected_user = os.environ.get("HERMES_DASHBOARD_USER", "vini")
+    if not hmac.compare_digest(user.encode(), expected_user.encode()):
+        return False
+    expected_hash = _dashboard_basic_hash_for_user(user)
+    if not expected_hash:
+        _auth_log.error("[AUTH-BASIC-MISSING-HASH]")
+        return False
+    return _check_bcrypt(password, expected_hash)
+
+
+def _mentee_auth_method(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    scheme, _, value = auth.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return "bearer" if _validate_mentee_bearer(value.strip()) else None
+    if scheme.lower() == "basic" and value.strip():
+        try:
+            decoded = base64.b64decode(value.strip(), validate=True).decode("utf-8")
+            user, password = decoded.split(":", 1)
+        except Exception as exc:
+            _auth_log.warning("[AUTH-BASIC-PARSE-ERR] error=%s", type(exc).__name__)
+            return None
+        return "basic" if _validate_dashboard_basic(user, password) else None
+    return None
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks
@@ -223,8 +347,51 @@ async def host_header_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require auth on protected API routes, including MentorHub service auth."""
     path = request.url.path
+    if path.startswith(MENTEE_API_PREFIX):
+        caller_ip = request.client.host if request.client else "unknown"
+        origin = request.headers.get("origin")
+        cors_headers = _mentee_cors_headers(origin)
+
+        if origin and not cors_headers:
+            _auth_log.warning(
+                "[AUTH-CORS-FAIL] path=%s ip=%s origin=%s",
+                path,
+                caller_ip,
+                origin,
+            )
+            return JSONResponse(status_code=403, content={"error": "cors_origin_forbidden"})
+
+        if request.method == "OPTIONS":
+            return Response(status_code=200, headers=cors_headers)
+
+        auth_method = _mentee_auth_method(request)
+        if auth_method:
+            request.state.auth_method = auth_method
+            _auth_log.warning(
+                "[AUTH-OK-%s] path=%s ip=%s",
+                auth_method.upper(),
+                path,
+                caller_ip,
+            )
+            response = await call_next(request)
+            for header, value in cors_headers.items():
+                response.headers[header] = value
+            return response
+
+        _auth_log.warning(
+            "[AUTH-FAIL] path=%s ip=%s preview=%s",
+            path,
+            caller_ip,
+            _mask_auth_header(request.headers.get("authorization", "")),
+        )
+        return JSONResponse(
+            status_code=401,
+            content={"error": "unauthorized"},
+            headers=cors_headers,
+        )
+
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
         if not _has_valid_session_token(request):
             return JSONResponse(
@@ -518,6 +685,166 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
         except Exception:
             continue
     return False, None
+
+
+def _mentee_database_url() -> str:
+    """Return the configured Postgres DSN for MentorHub lookup queries."""
+
+    explicit = (
+        os.getenv("MENTEE_LOOKUP_DATABASE_URL", "")
+        or os.getenv("HERMES_MEDIA_DISPATCH_DATABASE_URL", "")
+        or os.getenv("KANBAN_DATABASE_URL", "")
+        or os.getenv("HERMES_DB_URL", "")
+        or os.getenv("DATABASE_URL", "")
+    ).strip()
+    if explicit:
+        return explicit
+
+    host = os.getenv("PGHOST", "127.0.0.1").strip()
+    port = os.getenv("PGPORT", "5432").strip()
+    database = os.getenv("PGDATABASE", "hermes").strip()
+    user = os.getenv("PGUSER", "postgres").strip()
+    password = os.getenv("PGPASSWORD", "").strip()
+    if password:
+        return f"postgresql://{user}:{urllib.parse.quote(password, safe='')}@{host}:{port}/{database}"
+    return f"postgresql://{user}@{host}:{port}/{database}"
+
+
+async def _get_mentee_pg_pool() -> Any:
+    """Create one asyncpg pool per process for the mentee snapshot endpoint."""
+
+    global _mentee_pg_pool
+    if _mentee_pg_pool is not None:
+        return _mentee_pg_pool
+
+    try:
+        import asyncpg
+    except ImportError as exc:  # pragma: no cover - startup env issue
+        _auth_log.error("[MENTEE-DB-ASYNCPG-MISSING]")
+        raise HTTPException(status_code=500, detail="asyncpg_unavailable") from exc
+
+    _mentee_pg_pool = await asyncpg.create_pool(
+        _mentee_database_url(),
+        min_size=1,
+        max_size=int(os.getenv("MENTEE_LOOKUP_POOL_MAX_SIZE", "4")),
+        command_timeout=10,
+    )
+    return _mentee_pg_pool
+
+
+def _normalize_mentee_identifier(identifier: str) -> tuple[str, str] | None:
+    identifier = (identifier or "").strip()
+    if MONGO_ID_RE.match(identifier):
+        return "mentee_id", identifier
+    if OAB_RE.match(identifier):
+        return "oab", str(int(identifier))
+    _auth_log.warning("[RESOLVE-INVALID] identifier=%s", identifier)
+    return None
+
+
+async def resolve_mentee(identifier: str, pg_pool: Any | None = None) -> dict[str, Any] | None:
+    """Resolve OAB or Base44 mentee id to the canonical MentorHub cache record."""
+
+    normalized = _normalize_mentee_identifier(identifier)
+    if normalized is None:
+        return None
+
+    lookup_field, lookup_value = normalized
+    sql = f"""
+        SELECT mentee_id AS id, oab, nome, condutor, status
+          FROM mentorhub_cache.mentee_lookup
+         WHERE {lookup_field} = $1
+           AND COALESCE(status, '') NOT IN ('archived', 'internal_test')
+         LIMIT 1
+    """
+
+    pool = pg_pool or await _get_mentee_pg_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(sql, lookup_value)
+    return dict(row) if row else None
+
+
+@app.get("/api/mentee/{identifier}/snapshot")
+async def get_mentee_snapshot(identifier: str, request: Request):
+    started = time.perf_counter()
+    caller_ip = request.client.host if request.client else "unknown"
+    auth_method = getattr(request.state, "auth_method", "unknown")
+
+    cached = await cache_get(identifier)
+    if cached:
+        meta = cached.setdefault("meta", {})
+        meta["cache_hit"] = True
+        meta["latency_ms"] = max(1, int((time.perf_counter() - started) * 1000))
+        meta["auth_method"] = auth_method
+        mentee = cached.get("mentee") if isinstance(cached.get("mentee"), dict) else {}
+        _auth_log.warning(
+            json.dumps(
+                {
+                    "event": "snapshot_request",
+                    "mentee_oab": mentee.get("oab") or identifier,
+                    "mentee_id": mentee.get("id"),
+                    "caller_ip": caller_ip,
+                    "cache_hit": True,
+                    "latency_ms": meta["latency_ms"],
+                    "auth_method": auth_method,
+                },
+                default=str,
+                ensure_ascii=False,
+            )
+        )
+        return cached
+
+    mentee = await resolve_mentee(identifier)
+    if not mentee:
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+        _auth_log.warning(
+            json.dumps(
+                {
+                    "event": "snapshot_request",
+                    "mentee_oab": identifier,
+                    "mentee_id": None,
+                    "caller_ip": caller_ip,
+                    "cache_hit": False,
+                    "latency_ms": latency_ms,
+                    "auth_method": auth_method,
+                    "result": "404_not_found",
+                },
+                default=str,
+                ensure_ascii=False,
+            )
+        )
+        return JSONResponse(
+            status_code=404,
+            content={"error": "mentee_not_found", "identifier": identifier},
+        )
+
+    snapshot = await aggregate_snapshot(mentee, await _get_mentee_pg_pool())
+    snapshot["meta"]["cache_hit"] = False
+    snapshot["meta"]["latency_ms"] = max(1, int((time.perf_counter() - started) * 1000))
+    snapshot["meta"]["auth_method"] = auth_method
+    cache_set_background(identifier, snapshot, ttl=snapshot_cache_ttl())
+    _auth_log.warning(
+        json.dumps(
+            {
+                "event": "snapshot_request",
+                "mentee_oab": mentee.get("oab") or identifier,
+                "mentee_id": mentee.get("id"),
+                "caller_ip": caller_ip,
+                "cache_hit": False,
+                "latency_ms": snapshot["meta"]["latency_ms"],
+                "auth_method": auth_method,
+                "sections": {
+                    "trafego": len(snapshot.get("trafego_cards") or []),
+                    "sla": len(snapshot.get("sla_alerts") or []),
+                    "kanban": len(snapshot.get("kanban_tasks") or []),
+                    "briefing": 1 if snapshot.get("latest_briefing") else 0,
+                },
+            },
+            default=str,
+            ensure_ascii=False,
+        )
+    )
+    return snapshot
 
 
 @app.get("/api/status")

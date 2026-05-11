@@ -27,6 +27,7 @@ class CustomAPIServerExtensions:
             ("kanban", self._mount_kanban),
             ("thumbnail", self._mount_thumbnail),
             ("eventos", self._mount_eventos),
+            ("hotmart", self._mount_hotmart),
             ("postador_ads", self._mount_postador_ads),
             ("relatorios", self._mount_relatorios),
             ("feedback", self._mount_feedback),
@@ -93,6 +94,12 @@ class CustomAPIServerExtensions:
         from gateway.platforms._custom.eventos_router import mount_eventos_subapp
 
         mount_eventos_subapp(app, adapter)
+
+    @staticmethod
+    def _mount_hotmart(app: Any, adapter: Any) -> None:
+        from gateway.platforms._custom.hotmart_advogada_com_ia_router import mount_hotmart_subapp
+
+        mount_hotmart_subapp(app, adapter)
 
     @staticmethod
     def _mount_postador_ads(app: Any, adapter: Any) -> None:

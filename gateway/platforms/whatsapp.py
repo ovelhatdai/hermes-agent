@@ -1815,8 +1815,43 @@ class WhatsAppAdapter(BasePlatformAdapter):
             logger.warning("[%s] feedback reaction detection failed: %s", self.name, exc)
         return False
 
+
+    async def _maybe_handle_spec_change_pushback(self, event: MessageEvent) -> bool:
+        """SPEC-121 R7: block ambiguous/risky spec-runtime changes before LLM."""
+        try:
+            from agent.extensions.spec_change_pushback import (
+                evaluate_pushback,
+                format_pushback_message,
+                record_decision,
+            )
+            decision = evaluate_pushback(
+                event.text or "",
+                change_type="runtime" if "runtime" in (event.text or "").lower() else "scope",
+                target_surface="whatsapp",
+            )
+            if not decision.should_gate:
+                return False
+            raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+            sender = event.source.user_id or raw.get("senderId") or raw.get("chatId") or ""
+            record_decision(
+                decision,
+                request_text=event.text or "",
+                sender=sender,
+                chat_id=event.source.chat_id,
+            )
+            message = format_pushback_message(decision)
+            if message:
+                await self.send(event.source.chat_id, message, reply_to=event.message_id)
+                return True
+            return False
+        except Exception as exc:
+            logger.warning("[%s] spec-change pushback failed open: %s", self.name, exc)
+            return False
+
     async def handle_message(self, event: MessageEvent) -> None:
         if await self._maybe_record_feedback_reaction(event):
+            return
+        if await self._maybe_handle_spec_change_pushback(event):
             return
         if await self._handle_content_media_decision(event):
             return
