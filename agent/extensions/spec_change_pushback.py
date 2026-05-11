@@ -12,15 +12,30 @@ from typing import Iterable
 
 log = logging.getLogger(__name__)
 
-SPEC_CHANGE_PATTERNS = [
+TECHNICAL_TARGET_PATTERNS = [
     r"\bspec[- ]?\d+", r"\bspec\b", r"\bcompozy\b", r"\bruntime\b",
     r"\bdeploy\b", r"\bprodução\b", r"\bproducao\b", r"\baceite\b",
-    r"\bprioridade\b", r"\bagente\b", r"\bhermes\b", r"\btask\b",
+    r"\bprioridade\b", r"\btask\b", r"\bservi[cç]o\b", r"\bsystemd\b",
+    r"\btimer\b", r"\bworker\b", r"\bendpoint\b", r"\bwebhook\b",
+    r"\bporta\b", r"\bpostgres\b", r"\bbanco\b", r"\bgit\b", r"\brebase\b",
+    r"\brollback\b", r"\bauto-update\b", r"\bbranch\b", r"\bfork\b",
+]
+ACTION_PATTERNS = [
     r"\brodar\b", r"\bexecutar\b", r"\bimplementar\b", r"\bativar\b",
-    r"\bdesativar\b", r"\bmudar\b", r"\bmuda\b", r"\bcorrigir\b", r"\bcorrija\b",
+    r"\bdesativar\b", r"\bmudar\b", r"\bmuda\b", r"\balterar\b",
+    r"\bcorrigir\b", r"\bcorrija\b", r"\baplicar\b", r"\bdeployar\b",
+    r"\bsubir\b", r"\breiniciar\b", r"\bbaixar\b", r"\bmarcar done\b",
+    r"\bmover pra done\b", r"\bcommitar\b", r"\bmergear\b", r"\bdeletar\b",
+]
+COMPLAINT_OR_CLARIFICATION_PATTERNS = [
+    r"\bn[aã]o entendi\b", r"\bme explica\b", r"\bexplica\b", r"\bentender\b",
+    r"\bo que aconteceu\b", r"\bo que esta acontecendo\b", r"\bo que está acontecendo\b",
+    r"\bn[aã]o me serve\b", r"\bsem sentido\b", r"\bruim\b", r"\bbobagem\b",
+    r"\bn[aã]o funciona\b", r"\bnao funciona\b", r"\bestou bravo\b", r"\bestou confuso\b",
+    r"\bcliente\b", r"\bme ajuda entender\b",
 ]
 SIMPLE_READ_PATTERNS = [
-    r"\bo que é\b", r"\bo que e\b", r"\bexplica\b", r"\bstatus\b",
+    r"\bo que é\b", r"\bo que e\b", r"\bexplica\b", r"\bentender\b", r"\bstatus\b",
     r"\blista\b", r"\bmostra\b", r"\baudita\b", r"\bvalida\b", r"\bverifica\b",
 ]
 OVERRIDE_PATTERNS = [
@@ -72,15 +87,19 @@ def _any(patterns: Iterable[str], text: str) -> bool:
 def classify_request(text: str) -> tuple[bool, bool, bool, bool]:
     normalized = (text or "").strip().lower()
     override = _any(OVERRIDE_PATTERNS, normalized)
-    specish = _any(SPEC_CHANGE_PATTERNS, normalized)
-    read_only = _any(SIMPLE_READ_PATTERNS, normalized) and not _any(
-        [r"\bmuda\b", r"\bcorrige\b", r"\bimplementa\b", r"\bativa\b", r"\bdesativa\b"],
-        normalized,
-    )
     risky = _any(RISKY_SCOPE_PATTERNS, normalized)
     scoped = _any(GOOD_SCOPE_PATTERNS, normalized)
-    return specish and not read_only, override, risky, scoped
 
+    # R7 is a safety gate, not a customer-support answer. It should only
+    # interrupt when Vinicius is asking Hermes to change a technical surface.
+    # Complaints, confusion and diagnosis requests must go to the normal LLM.
+    complaint_or_clarification = _any(COMPLAINT_OR_CLARIFICATION_PATTERNS, normalized)
+    action = _any(ACTION_PATTERNS, normalized)
+    technical_target = _any(TECHNICAL_TARGET_PATTERNS, normalized)
+    read_only = _any(SIMPLE_READ_PATTERNS, normalized) and not action
+
+    should_gate = action and technical_target and not read_only and not complaint_or_clarification
+    return should_gate, override, risky, scoped
 
 def evaluate_pushback(request_text: str, *, change_type: str = "unknown", target_surface: str = "whatsapp") -> PushbackDecision:
     should_gate, override, risky, scoped = classify_request(request_text)

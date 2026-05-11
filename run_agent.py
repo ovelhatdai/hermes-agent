@@ -13177,9 +13177,9 @@ class AIAgent:
                             continue
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
-                            self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                            self._emit_status("Limite do modelo atingido. Vou registrar a mensagem sem simular resposta.")
                         else:
-                            self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+                            self._emit_status(f"API falhou depois de {max_retries} tentativas — {_final_summary}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                         # Detect SSE stream-drop pattern (e.g. "Network
@@ -13221,7 +13221,14 @@ class AIAgent:
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )
                         self._persist_session(messages, conversation_history)
-                        _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                        if is_rate_limited:
+                            _final_response = (
+                                "Recebi tua mensagem, mas o modelo bateu limite de uso agora. "
+                                "Nao vou fingir uma resposta nem mandar erro tecnico. "
+                                "Registrei o pedido no contexto; tenta de novo em alguns minutos ou troca o modelo/fallback."
+                            )
+                        else:
+                            _final_response = f"Falha tecnica depois de {max_retries} tentativas: {_final_summary}"
                         if _is_stream_drop:
                             _final_response += (
                                 "\n\nThe provider's stream connection keeps "
@@ -13253,9 +13260,9 @@ class AIAgent:
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                     if is_rate_limited:
-                        self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
+                        self._emit_status(f"Modelo com limite temporario. Tentando de novo em {wait_time:.1f}s ({retry_count + 1}/{max_retries}).")
                     else:
-                        self._emit_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                        self._emit_status(f"Tentando de novo em {wait_time:.1f}s ({retry_count}/{max_retries}).")
                     logger.warning(
                         "Retrying API call in %ss (attempt %s/%s) %s error=%s",
                         wait_time,

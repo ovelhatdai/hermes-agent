@@ -7063,7 +7063,7 @@ class GatewayRunner:
             elif status_code == 402:
                 status_hint = " Your API balance or quota is exhausted. Check your provider dashboard."
             elif status_code == 429:
-                # Check if this is a plan usage limit (resets on a schedule) vs a transient rate limit
+                # Check if this is a plan usage limit (resets on a schedule) vs a transient rate limit.
                 _err_body = getattr(e, "response", None)
                 _err_json = {}
                 try:
@@ -7076,11 +7076,11 @@ class GatewayRunner:
                     if _resets_in and _resets_in > 0:
                         import math
                         _hours = math.ceil(_resets_in / 3600)
-                        status_hint = f" Your plan's usage limit has been reached. It resets in ~{_hours}h."
+                        status_hint = f" O modelo bateu o limite do plano e deve resetar em aproximadamente {_hours}h."
                     else:
-                        status_hint = " Your plan's usage limit has been reached. Please wait until it resets."
+                        status_hint = " O modelo bateu o limite do plano. Espera resetar ou troca o fallback."
                 else:
-                    status_hint = " You are being rate-limited. Please wait a moment and try again."
+                    status_hint = " O modelo esta rate limited agora. Espera um pouco ou troca o fallback."
             elif status_code == 529:
                 status_hint = " The API is temporarily overloaded. Please try again shortly."
             elif status_code in (400, 500):
