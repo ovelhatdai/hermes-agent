@@ -6770,6 +6770,11 @@ class GatewayRunner:
             response = _normalize_empty_agent_response(
                 agent_result, response, history_len=len(history),
             )
+            try:
+                from gateway.operational_footer import ensure_operational_footer as _ensure_fo
+                response = _ensure_fo(response, message_text)
+            except Exception as _fo_err:
+                logger.debug("SPEC-159 operational footer fallback failed: %s", _fo_err)
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -13526,6 +13531,24 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            # WhatsApp e superficie de usuario final: nao vazar status tecnico
+            # de transporte/modelo. O detalhe continua no log do gateway.
+            _platform_value = getattr(source.platform, "value", source.platform)
+            if _platform_value == "whatsapp" and event_type == "lifecycle":
+                _msg_lower = str(message or "").lower()
+                _hidden_phrases = (
+                    "connection to provider dropped",
+                    "reconnected",
+                    "remoteprotocolerror",
+                    "max retries",
+                    "api falhou",
+                    "modelo com limite temporario",
+                    "limite do modelo atingido",
+                    "rate limited",
+                )
+                if any(_phrase in _msg_lower for _phrase in _hidden_phrases):
+                    logger.info("suppressed whatsapp lifecycle status: %s", str(message)[:180])
+                    return
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(

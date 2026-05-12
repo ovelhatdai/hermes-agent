@@ -1196,6 +1196,11 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = result.get("error", "(No response generated)")
+        try:
+            from gateway.operational_footer import ensure_operational_footer as _ensure_fo
+            final_response = _ensure_fo(final_response, user_message)
+        except Exception:
+            pass
 
         response_data = {
             "id": completion_id,
@@ -2196,6 +2201,11 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = result.get("error", "(No response generated)")
+        try:
+            from gateway.operational_footer import ensure_operational_footer as _ensure_fo
+            final_response = _ensure_fo(final_response, user_message)
+        except Exception:
+            pass
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
