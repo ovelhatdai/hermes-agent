@@ -63,6 +63,12 @@ _HERMES_CORE_TOOLS = [
     "familia_atualizar_dado", "familia_preencher_formulario",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # SPEC-163 traffic manager: Meta Ads history, exact-period API, CAC inputs and card rendering
+    "ads_historico_health", "resolver_agrupamento_meta",
+    "get_ads_historico", "get_meta_ads_periodo",
+    "registrar_input_trafego_periodo", "registrar_contratos_periodo",
+    "calcular_cac", "gerar_card_trafego_periodo",
+    "gestor_trafego_responder",
     # Kanban multi-agent coordination — only in schema when the agent is
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set), otherwise
     # zero schema footprint. Gated via check_fn in tools/kanban_tools.py.
