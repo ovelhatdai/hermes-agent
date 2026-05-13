@@ -22,8 +22,8 @@ GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v20.0")
 GRAPH_BASE_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
 CARD_DIR = Path(os.getenv("ADS_CARD_OUTPUT_DIR", "/var/www/monitor/trafego-cards"))
 CARD_PUBLIC_BASE = os.getenv("ADS_CARD_PUBLIC_BASE", "https://monitor.advogando100k.com.br/trafego-cards")
-ADMIN_PHONES = {"5551991987972", "5551984213925"}
-TRAFFIC_ALLOWED_PHONES = ADMIN_PHONES | {"5551989150954", "21453999210580"}
+ADMIN_PHONES = {"5551991987972", "5551984213925", "5551989150954", "5551988150954", "21453999210580"}
+TRAFFIC_ALLOWED_PHONES = ADMIN_PHONES | {"5551989150954", "5551988150954", "555189150954", "1099595579392", "21453999210580"}
 
 
 def _json(data: dict[str, Any]) -> str:
@@ -113,6 +113,10 @@ async def _audit(conn: asyncpg.Connection, tool: str, args: dict[str, Any], summ
     try:
         start = args.get("data_inicio") or args.get("period_start") or args.get("start")
         end = args.get("data_fim") or args.get("period_end") or args.get("end")
+        if start and not isinstance(start, date):
+            start = date.fromisoformat(str(start)[:10])
+        if end and not isinstance(end, date):
+            end = date.fromisoformat(str(end)[:10])
         await conn.execute(
             """
             INSERT INTO ads.query_audit_log(tool_name, requester, scope_type, scope_key, offer_key, period_start, period_end, result_summary)
@@ -169,6 +173,18 @@ async def _resolve_accounts(conn: asyncpg.Connection, scope_type: str | None, sc
             """,
             f"%{needle}%",
         )
+        if not rows and needle:
+            tokens = [t for t in re.findall(r"[a-z0-9]+", needle.lower()) if len(t) >= 4]
+            all_rows = await conn.fetch("SELECT * FROM ads.accounts WHERE business_key='mentorada' ORDER BY account_name")
+            scored = []
+            min_score = 2 if len(tokens) >= 2 else 1
+            for row in all_rows:
+                haystack = f"{row.get('account_name') or ''} {row.get('tenant_key') or ''}".lower()
+                score = sum(1 for token in tokens if token in haystack)
+                if score >= min_score:
+                    scored.append((score, row))
+            scored.sort(key=lambda item: (-item[0], str(item[1].get('account_name') or '')))
+            rows = [item[1] for item in scored[:20]]
     else:
         needle = q or scope_key
         if not needle:
@@ -182,6 +198,18 @@ async def _resolve_accounts(conn: asyncpg.Connection, scope_type: str | None, sc
                 """,
                 f"%{needle}%",
             )
+            if not rows:
+                tokens = [t for t in re.findall(r"[a-z0-9]+", needle.lower()) if len(t) >= 4]
+                all_rows = await conn.fetch("SELECT * FROM ads.accounts WHERE business_key='mentorada' ORDER BY account_name")
+                scored = []
+                min_score = 2 if len(tokens) >= 2 else 1
+                for row in all_rows:
+                    haystack = f"{row.get('account_name') or ''} {row.get('tenant_key') or ''}".lower()
+                    score = sum(1 for token in tokens if token in haystack)
+                    if score >= min_score:
+                        scored.append((score, row))
+                scored.sort(key=lambda item: (-item[0], str(item[1].get('account_name') or '')))
+                rows = [item[1] for item in scored[:20]]
     return [dict(r) for r in rows]
 
 
@@ -218,6 +246,21 @@ def _row_matches_offer(row: asyncpg.Record | dict[str, Any], patterns: list[dict
             if pattern.lower() in " ".join(values).lower():
                 return True
     return False
+
+
+
+
+def _offer_mapping_missing_result(scope_type: str | None, scope_key: str | None, offer_key: str | None, start: date, end: date) -> dict[str, Any]:
+    return {
+        "success": False,
+        "error": "offer_mapping_missing",
+        "scope_type": scope_type,
+        "scope_key": scope_key,
+        "offer_key": offer_key,
+        "period_start": start,
+        "period_end": end,
+        "warning": "Nao ha mapeamento confiavel de campanha/adset/ad para separar esta oferta dentro da macro-conta. Use o agregado da macro-conta ou padronize tagging antes de separar.",
+    }
 
 
 async def _aggregate_postgres(conn: asyncpg.Connection, accounts: list[dict[str, Any]], start: str, end: str, patterns: list[dict[str, Any]]) -> dict[str, Any]:
@@ -465,6 +508,10 @@ async def _get_ads_historico(args: dict[str, Any], **_: Any) -> str:
     try:
         accounts = await _resolve_accounts(conn, scope_type, scope_key, args.get("q"))
         patterns = await _offer_patterns(conn, args.get("grupo") or (scope_key if scope_type == "group" else None), offer_key)
+        if offer_key and not patterns:
+            result = _offer_mapping_missing_result(scope_type, scope_key, offer_key, start, end)
+            await _audit(conn, "get_ads_historico", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"error": "offer_mapping_missing"})
+            return _json(result)
         result = await _aggregate_meta_export(conn, scope_key if scope_type == "group" else None, start, end) or await _aggregate_postgres(conn, accounts, start, end, patterns)
         result.update({"success": True, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end, "data_source": "postgres_history"})
         await _audit(conn, "get_ads_historico", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"spend": result.get("spend"), "leads": result.get("leads"), "accounts": len(accounts)})
@@ -539,6 +586,8 @@ async def _registrar_contratos_periodo(args: dict[str, Any], **kw: Any) -> str:
 
 async def _calcular_cac(args: dict[str, Any], **_: Any) -> str:
     requester = _requester(args)
+    if not _is_traffic_allowed(requester):
+        return _json({"success": False, "error": "acesso_negado"})
     start, end = _period(args)
     scope_type = args.get("scope_type") or ("group" if args.get("grupo") else "mentee" if args.get("mentorada") else "account" if args.get("conta") else None)
     scope_key = args.get("scope_key") or args.get("grupo") or args.get("mentorada") or args.get("conta")
@@ -547,7 +596,23 @@ async def _calcular_cac(args: dict[str, Any], **_: Any) -> str:
     try:
         accounts = await _resolve_accounts(conn, scope_type, scope_key, args.get("q"))
         patterns = await _offer_patterns(conn, args.get("grupo") or (scope_key if scope_type == "group" else None), offer_key)
+        if offer_key and not patterns:
+            result = _offer_mapping_missing_result(scope_type, scope_key, offer_key, start, end)
+            await _audit(conn, "calcular_cac", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"error": "offer_mapping_missing"})
+            return _json(result)
         ads = await _aggregate_meta_export(conn, scope_key if scope_type == "group" else None, start, end) or await _aggregate_postgres(conn, accounts, start, end, patterns)
+        api_refresh_note = None
+        if bool(args.get("refresh") or args.get("usar_api_meta")):
+            api_limit = int(args.get("api_limit") or 3)
+            if accounts and len(accounts) <= api_limit:
+                api_ads = await _fetch_meta_api(accounts, start, end, level=str(args.get("level") or "campaign"))
+                if not api_ads.get("errors") and (api_ads.get("spend") or api_ads.get("leads")):
+                    ads = api_ads
+                    api_refresh_note = "metricas_atualizadas_via_meta_api"
+                else:
+                    api_refresh_note = f"meta_api_indisponivel_ou_sem_dados: {len(api_ads.get('errors') or [])} erro(s)"
+            else:
+                api_refresh_note = f"meta_api_nao_chamada: escopo tem {len(accounts)} conta(s), limite {api_limit}"
         latest = await conn.fetchrow(
             """
             SELECT * FROM ads.v_period_inputs_latest
@@ -574,6 +639,7 @@ async def _calcular_cac(args: dict[str, Any], **_: Any) -> str:
         revenue_for_roi = actual if actual not in (None, "") else projected
         roi = (Decimal(str(revenue_for_roi)) / spend).quantize(Decimal("0.01")) if revenue_for_roi not in (None, "") and spend else None
         masked = (not _is_admin(requester)) and scope_type in {"group", "business"} and scope_key in {"des", "advogando_adn"}
+        ads_source = ads.get("data_source", "postgres_history")
         result = {
             "success": True,
             "scope_type": scope_type,
@@ -593,17 +659,21 @@ async def _calcular_cac(args: dict[str, Any], **_: Any) -> str:
             "roi": None if masked else roi,
             "finance_masked": masked,
             "input_source": "args" if (args.get("contracts") or args.get("contratos")) else ("period_inputs" if inp else "missing"),
-            "ads_source": ads.get("data_source", "postgres_history"),
+            "ads_source": ads_source,
             "accounts": ads.get("by_account", []),
             "notes": [] if contracts_i else ["Sem contratos no periodo; informe contratos para calcular CAC e conversao."],
         }
+        if api_refresh_note:
+            result["notes"].append(api_refresh_note)
+        if ads.get("errors"):
+            result["meta_api_errors"] = ads.get("errors")
         if not bool(args.get("dry_run") or False):
             await conn.execute(
                 """
                 INSERT INTO ads.period_metrics(scope_type, scope_key, offer_key, period_start, period_end, spend, impressions, clicks, leads, contracts, budget, projected_revenue, actual_revenue, cpl, cac, conversion_rate, roi, data_source, raw_json)
-                VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'postgres_history',$18::jsonb)
+                VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb)
                 """,
-                scope_type, scope_key, offer_key, start, end, spend, ads.get("impressions") or 0, ads.get("clicks") or 0, leads, contracts_i, budget, projected, actual, cpl, cac, conversion, roi, json.dumps(result, ensure_ascii=False, default=_json_default)
+                scope_type, scope_key, offer_key, start, end, spend, ads.get("impressions") or 0, ads.get("clicks") or 0, leads, contracts_i, budget, projected, actual, cpl, cac, conversion, roi, ads_source, json.dumps(result, ensure_ascii=False, default=_json_default)
             )
         await _audit(conn, "calcular_cac", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"spend": spend, "leads": leads, "contracts": contracts_i, "cac": cac})
         return _json(result)

@@ -4754,6 +4754,8 @@ class GatewayRunner:
             return True
 
         check_ids = {user_id}
+        if getattr(source, "user_id_alt", None):
+            check_ids.add(str(source.user_id_alt))
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
 
@@ -6771,8 +6773,8 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             try:
-                from gateway.operational_footer import ensure_operational_footer as _ensure_fo
-                response = _ensure_fo(response, message_text)
+                from gateway.operational_footer import ensure_operational_footer_async as _ensure_fo
+                response = await _ensure_fo(response, message_text)
             except Exception as _fo_err:
                 logger.debug("SPEC-159 operational footer fallback failed: %s", _fo_err)
 

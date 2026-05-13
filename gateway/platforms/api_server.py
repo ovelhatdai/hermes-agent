@@ -1197,8 +1197,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
         try:
-            from gateway.operational_footer import ensure_operational_footer as _ensure_fo
-            final_response = _ensure_fo(final_response, user_message)
+            from gateway.operational_footer import ensure_operational_footer_async as _ensure_fo
+            final_response = await _ensure_fo(final_response, user_message)
         except Exception:
             pass
 
@@ -2202,8 +2202,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
         try:
-            from gateway.operational_footer import ensure_operational_footer as _ensure_fo
-            final_response = _ensure_fo(final_response, user_message)
+            from gateway.operational_footer import ensure_operational_footer_async as _ensure_fo
+            final_response = await _ensure_fo(final_response, user_message)
         except Exception:
             pass
 

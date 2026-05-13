@@ -902,6 +902,53 @@ class SlackAdapter(BasePlatformAdapter):
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
+    def _slack_user_id_map(self) -> Dict[str, str]:
+        """Map Slack user IDs to internal Hermes user IDs.
+
+        Accepts either JSON object syntax or a simple comma-separated list:
+        ``U123:vinicius,U456:joao``. The raw Slack ID remains available as
+        ``SessionSource.user_id_alt`` so authorization can still use the
+        platform ID while sessions/audit can identify the internal user.
+        """
+        raw = (
+            self.config.extra.get("user_id_map")
+            or self.config.extra.get("users")
+            or os.getenv("SLACK_USER_ID_MAP", "")
+        )
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return {
+                str(k).strip(): str(v).strip()
+                for k, v in raw.items()
+                if str(k).strip() and str(v).strip()
+            }
+
+        text = str(raw).strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return {
+                    str(k).strip(): str(v).strip()
+                    for k, v in parsed.items()
+                    if str(k).strip() and str(v).strip()
+                }
+        except Exception:
+            pass
+
+        mapped: Dict[str, str] = {}
+        for item in text.split(","):
+            if ":" not in item:
+                continue
+            slack_id, internal_id = item.split(":", 1)
+            slack_id = slack_id.strip()
+            internal_id = internal_id.strip()
+            if slack_id and internal_id:
+                mapped[slack_id] = internal_id
+        return mapped
+
     def _resolve_thread_ts(
         self,
         reply_to: Optional[str] = None,
@@ -1841,6 +1888,10 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts=event.get("thread_ts", ""),
         )
         user_id = event.get("user") or assistant_meta.get("user_id", "")
+        raw_user_id = user_id
+        internal_user_id = self._slack_user_id_map().get(raw_user_id)
+        if internal_user_id:
+            user_id = internal_user_id
         if not channel_id:
             channel_id = assistant_meta.get("channel_id", "")
         team_id = (
@@ -2101,7 +2152,9 @@ class SlackAdapter(BasePlatformAdapter):
                 msg_type = MessageType.DOCUMENT
 
         # Resolve user display name (cached after first lookup)
-        user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
+        user_name = await self._resolve_user_name(raw_user_id, chat_id=channel_id)
+        if internal_user_id:
+            user_name = internal_user_id
 
         # Build source
         source = self.build_source(
@@ -2111,6 +2164,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            user_id_alt=raw_user_id if internal_user_id else None,
         )
 
         # Per-channel ephemeral prompt
