@@ -6,16 +6,20 @@ import json
 import os
 import re
 import textwrap
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import asyncpg
 import requests
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ModuleNotFoundError:
+    Image = ImageDraw = ImageFont = None
 
 from tools.registry import registry
+from tools.jid_scope_resolver import RESPOSTA_BLOQUEIO_COMPARATIVO, resolve_scope_async
 
 DEFAULT_DB_URL = "postgresql://postgres@127.0.0.1:5432/hermes"
 GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v20.0")
@@ -24,6 +28,7 @@ CARD_DIR = Path(os.getenv("ADS_CARD_OUTPUT_DIR", "/var/www/monitor/trafego-cards
 CARD_PUBLIC_BASE = os.getenv("ADS_CARD_PUBLIC_BASE", "https://monitor.advogando100k.com.br/trafego-cards")
 ADMIN_PHONES = {"5551991987972", "5551984213925", "5551989150954", "5551988150954", "21453999210580"}
 TRAFFIC_ALLOWED_PHONES = ADMIN_PHONES | {"5551989150954", "5551988150954", "555189150954", "1099595579392", "21453999210580"}
+CORE_EXPECTED_ACCOUNTS = {"des": 7}
 
 
 def _json(data: dict[str, Any]) -> str:
@@ -496,7 +501,398 @@ async def _resolver_agrupamento_meta(args: dict[str, Any], **_: Any) -> str:
         await conn.close()
 
 
-async def _get_ads_historico(args: dict[str, Any], **_: Any) -> str:
+def _scope_allowed(group_key: str, scope: dict[str, Any]) -> bool:
+    allowed = scope.get("allowed_groups") or []
+    return "*" in allowed or group_key in allowed
+
+
+def _iso_week_key(value: date) -> str:
+    year, week, _ = value.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _sum_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    totals = {"spend": Decimal("0"), "leads": 0, "impressions": 0, "clicks": 0}
+    business_keys: set[str] = set()
+    for row in rows:
+        totals["spend"] += Decimal(str(row.get("spend") or 0))
+        totals["leads"] += int(row.get("leads") or 0)
+        totals["impressions"] += int(row.get("impressions") or 0)
+        totals["clicks"] += int(row.get("clicks") or 0)
+        if row.get("business_key"):
+            business_keys.add(str(row["business_key"]))
+    leads = int(totals["leads"])
+    clicks = int(totals["clicks"])
+    impressions = int(totals["impressions"])
+    spend = totals["spend"]
+    return {
+        "spend": spend,
+        "leads": leads,
+        "impressions": impressions,
+        "clicks": clicks,
+        "cpl": (spend / Decimal(leads)).quantize(Decimal("0.01")) if leads else None,
+        "ctr": ((Decimal(clicks) / Decimal(impressions)) * Decimal("100")).quantize(Decimal("0.01")) if impressions else None,
+        "business_keys": sorted(business_keys),
+    }
+
+
+def _pct_delta(current: Any, previous: Any) -> float | None:
+    current_d = Decimal(str(current or 0))
+    previous_d = Decimal(str(previous or 0))
+    if previous_d == 0:
+        return None
+    return float(((current_d - previous_d) / previous_d * Decimal("100")).quantize(Decimal("0.01")))
+
+
+def _delta_payload(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    mapping = {
+        "gasto": ("spend", "gasto"),
+        "leads": ("leads", "leads"),
+        "impressions": ("impressions", "impressions"),
+        "clicks": ("clicks", "clicks"),
+        "cpl": ("cpl", "cpl"),
+        "ctr": ("ctr", "ctr"),
+    }
+    delta: dict[str, Any] = {}
+    for prefix, (key, label) in mapping.items():
+        cur = current.get(key) or 0
+        prev = previous.get(key) or 0
+        delta[f"{prefix}_abs"] = float(Decimal(str(cur)) - Decimal(str(prev))) if isinstance(cur, Decimal) or isinstance(prev, Decimal) else cur - prev
+        delta[f"{prefix}_pct"] = _pct_delta(cur, prev)
+        delta[f"{label}_anterior"] = prev
+    return delta
+
+
+def _previous_period(start: date, end: date, comparar_com: str) -> tuple[date, date]:
+    if comparar_com == "periodo_anterior":
+        days = (end - start).days + 1
+        return start - timedelta(days=days), end - timedelta(days=days)
+    if comparar_com == "ano_anterior":
+        try:
+            return start.replace(year=start.year - 1), end.replace(year=end.year - 1)
+        except ValueError:
+            return start - timedelta(days=365), end - timedelta(days=365)
+    raise ValueError("comparar_com deve ser 'periodo_anterior' ou 'ano_anterior'")
+
+
+async def _column_exists(conn: asyncpg.Connection, table_name: str, column_name: str) -> bool:
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.columns
+              WHERE table_schema='ads' AND table_name=$1 AND column_name=$2
+            )
+            """,
+            table_name,
+            column_name,
+        )
+    )
+
+
+async def _expected_accounts(conn: asyncpg.Connection, group_key: str, has_coverage_status: bool) -> list[dict[str, Any]]:
+    active_clause = "AND COALESCE(a.coverage_status, 'active') = 'active'" if has_coverage_status else ""
+    rows = await conn.fetch(
+        f"""
+        SELECT DISTINCT
+            a.ad_account_id,
+            a.account_name,
+            a.business_key
+        FROM ads.account_group_members agm
+        JOIN ads.accounts a ON a.ad_account_id = agm.ad_account_id
+        WHERE agm.group_key = $1
+          {active_clause}
+        ORDER BY a.account_name
+        """,
+        group_key,
+    )
+    return [dict(row) for row in rows]
+
+
+async def _query_daily_insights(
+    conn: asyncpg.Connection,
+    group_key: str,
+    start: date,
+    end: date,
+    has_coverage_status: bool,
+) -> list[dict[str, Any]]:
+    active_clause = "AND COALESCE(a.coverage_status, 'active') = 'active'" if has_coverage_status else ""
+    rows = await conn.fetch(
+        f"""
+        SELECT
+            agm.group_key,
+            a.business_key,
+            a.ad_account_id,
+            a.account_name,
+            i.date,
+            SUM(i.spend) AS spend,
+            SUM(i.leads)::bigint AS leads,
+            SUM(i.impressions)::bigint AS impressions,
+            SUM(i.clicks)::bigint AS clicks
+        FROM ads.daily_insights i
+        JOIN ads.accounts a ON a.ad_account_id = i.ad_account_id
+        JOIN ads.account_group_members agm ON agm.ad_account_id = a.ad_account_id
+        WHERE agm.group_key = $1
+          AND i.date BETWEEN $2::date AND $3::date
+          {active_clause}
+        GROUP BY agm.group_key, a.business_key, a.ad_account_id, a.account_name, i.date
+        ORDER BY i.date, a.account_name
+        """,
+        group_key,
+        start,
+        end,
+    )
+    return [dict(row) for row in rows]
+
+
+def _coverage_payload(expected: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    expected_ids = {row["ad_account_id"]: row for row in expected}
+    data_ids = {row["ad_account_id"] for row in rows}
+    if len(data_ids) >= len(expected_ids):
+        return None
+    missing = [row.get("account_name") or row.get("ad_account_id") for aid, row in expected_ids.items() if aid not in data_ids]
+    return {
+        "contas_com_dado": len(data_ids),
+        "contas_esperadas": len(expected_ids),
+        "contas_faltantes": missing,
+    }
+
+
+def _group_rows(rows: list[dict[str, Any]], agrupamento: str) -> list[dict[str, Any]]:
+    agrupamento = (agrupamento or "total").lower()
+    if agrupamento == "total":
+        totals = _sum_rows(rows)
+        return [{
+            "agrupamento": "total",
+            "spend": totals["spend"],
+            "leads": totals["leads"],
+            "impressions": totals["impressions"],
+            "clicks": totals["clicks"],
+            "cpl": totals["cpl"],
+            "ctr": totals["ctr"],
+            "business_keys": totals["business_keys"],
+        }]
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if agrupamento == "semana":
+            key = _iso_week_key(row["date"])
+        elif agrupamento == "conta":
+            key = str(row.get("ad_account_id") or "")
+        else:
+            key = _date_s(row["date"])
+        buckets.setdefault(key, []).append(row)
+    series = []
+    for key in sorted(buckets):
+        totals = _sum_rows(buckets[key])
+        item = {
+            "agrupamento": agrupamento if agrupamento in {"semana", "conta"} else "dia",
+            "chave": key,
+            "spend": totals["spend"],
+            "leads": totals["leads"],
+            "impressions": totals["impressions"],
+            "clicks": totals["clicks"],
+            "cpl": totals["cpl"],
+            "ctr": totals["ctr"],
+        }
+        if agrupamento == "conta":
+            first = buckets[key][0]
+            item["account_name"] = first.get("account_name")
+            item["business_key"] = first.get("business_key")
+        series.append(item)
+    return series
+
+
+async def _get_ads_historico_core(
+    conn: asyncpg.Connection,
+    group_key: str,
+    start: date,
+    end: date,
+    agrupamento: str = "total",
+    comparar_com: str | None = None,
+    requesting_jid: str | None = None,
+    original_prompt: str = "",
+) -> dict[str, Any]:
+    scope = await resolve_scope_async(requesting_jid, original_prompt, conn=conn)
+    if scope.get("block"):
+        return {
+            "success": False,
+            "erro": "scope_unknown_blocked",
+            "error": "scope_unknown_blocked",
+            "motivo": "JID desconhecido sem permissao para consultar trafego.",
+            "group_key": group_key,
+            "fonte": "ads.daily_insights",
+            "alerta_vini": bool(scope.get("alerta_vini")),
+        }
+    if scope.get("block_comparative"):
+        return {
+            "success": False,
+            "erro": "scope_comparativo_bloqueado",
+            "error": "scope_comparativo_bloqueado",
+            "mensagem_para_usuario": RESPOSTA_BLOQUEIO_COMPARATIVO,
+            "group_key": group_key,
+            "fonte": "ads.daily_insights",
+        }
+    if not _scope_allowed(group_key, scope):
+        return {
+            "success": False,
+            "erro": "scope_denied",
+            "error": "scope_denied",
+            "motivo": f"JID sem permissao para consultar group_key={group_key}",
+            "group_key": group_key,
+            "fonte": "ads.daily_insights",
+        }
+    has_coverage_status = await _column_exists(conn, "accounts", "coverage_status")
+    expected = await _expected_accounts(conn, group_key, has_coverage_status)
+    if not expected:
+        return {
+            "success": False,
+            "erro": "group_not_found",
+            "error": "group_not_found",
+            "motivo": f"Nenhuma conta ativa encontrada para group_key={group_key}",
+            "group_key": group_key,
+            "fonte": "ads.daily_insights",
+        }
+    # BEGIN SPEC-163 DES export fallback
+    # DES can be temporarily covered by a manually audited Meta export while
+    # the system user token does not see every DES account in Marketing API.
+    export = await _aggregate_meta_export(conn, group_key, start, end)
+    if export:
+        spend = export.get("spend") or Decimal("0")
+        leads = int(export.get("leads") or 0)
+        cpl = export.get("cpl")
+        by_account = export.get("by_account") or []
+        if agrupamento == "conta":
+            series = [
+                {
+                    "agrupamento": "conta",
+                    "chave": item.get("account_name"),
+                    "account_name": item.get("account_name"),
+                    "spend": item.get("spend") or Decimal("0"),
+                    "leads": int(item.get("leads") or 0),
+                    "impressions": 0,
+                    "clicks": 0,
+                    "cpl": (Decimal(str(item.get("spend") or 0)) / Decimal(int(item.get("leads") or 0))).quantize(Decimal("0.01")) if int(item.get("leads") or 0) else None,
+                    "ctr": None,
+                }
+                for item in by_account
+            ]
+        else:
+            series = [{
+                "agrupamento": "total",
+                "spend": spend,
+                "leads": leads,
+                "impressions": 0,
+                "clicks": 0,
+                "cpl": cpl,
+                "ctr": None,
+                "business_keys": ["des"],
+            }]
+        return {
+            "success": True,
+            "group_key": group_key,
+            "business_key": "des",
+            "business_keys": ["des"],
+            "periodo": {"inicio": start, "fim": end},
+            "period_start": start,
+            "period_end": end,
+            "agrupamento": agrupamento,
+            "gasto_total": spend,
+            "leads_total": leads,
+            "impressions_total": 0,
+            "clicks_total": 0,
+            "cpl_medio": cpl,
+            "ctr_medio": None,
+            "spend": spend,
+            "leads": leads,
+            "impressions": 0,
+            "clicks": 0,
+            "cpl": cpl,
+            "ctr": None,
+            "series": series,
+            "delta_vs_anterior": None,
+            "fonte": "meta_export_pool",
+            "data_source": "meta_export_pool",
+            "source_file": export.get("source_file"),
+            "accounts": export.get("accounts"),
+            "by_account": by_account,
+            "level_note": export.get("level_note"),
+            "atualizado_em": datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds"),
+            "schema_note": "fallback temporario auditado enquanto API Meta nao enxerga o pool DES completo",
+        }
+    # END SPEC-163 DES export fallback
+
+    rows = await _query_daily_insights(conn, group_key, start, end, has_coverage_status)
+    totals = _sum_rows(rows)
+    result: dict[str, Any] = {
+        "success": True,
+        "group_key": group_key,
+        "business_key": totals["business_keys"][0] if len(totals["business_keys"]) == 1 else None,
+        "business_keys": totals["business_keys"],
+        "periodo": {"inicio": start, "fim": end},
+        "period_start": start,
+        "period_end": end,
+        "agrupamento": agrupamento,
+        "gasto_total": totals["spend"],
+        "leads_total": totals["leads"],
+        "impressions_total": totals["impressions"],
+        "clicks_total": totals["clicks"],
+        "cpl_medio": totals["cpl"],
+        "ctr_medio": totals["ctr"],
+        "spend": totals["spend"],
+        "leads": totals["leads"],
+        "impressions": totals["impressions"],
+        "clicks": totals["clicks"],
+        "cpl": totals["cpl"],
+        "ctr": totals["ctr"],
+        "series": _group_rows(rows, agrupamento),
+        "delta_vs_anterior": None,
+        "fonte": "ads.daily_insights",
+        "data_source": "ads.daily_insights",
+        "atualizado_em": datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds"),
+        "schema_note": "coverage_status ausente; filtro active nao aplicado" if not has_coverage_status else None,
+    }
+    coverage = _coverage_payload(expected, rows)
+    if coverage:
+        result["coverage_parcial"] = coverage
+    if comparar_com:
+        prev_start, prev_end = _previous_period(start, end, comparar_com)
+        prev_rows = await _query_daily_insights(conn, group_key, prev_start, prev_end, has_coverage_status)
+        prev_totals = _sum_rows(prev_rows)
+        result["delta_vs_anterior"] = {
+            "comparar_com": comparar_com,
+            "periodo_anterior": {"inicio": prev_start, "fim": prev_end},
+            **_delta_payload(totals, prev_totals),
+        }
+    return result
+
+
+async def get_ads_historico(
+    group_key: str,
+    data_inicio: str,
+    data_fim: str,
+    agrupamento: str = "total",
+    comparar_com: str | None = None,
+    requesting_jid: str | None = None,
+    original_prompt: str = "",
+) -> dict[str, Any]:
+    conn = await _connect()
+    try:
+        return await _get_ads_historico_core(
+            conn=conn,
+            group_key=group_key,
+            start=date.fromisoformat(str(data_inicio)[:10]),
+            end=date.fromisoformat(str(data_fim)[:10]),
+            agrupamento=agrupamento,
+            comparar_com=comparar_com,
+            requesting_jid=requesting_jid,
+            original_prompt=original_prompt,
+        )
+    finally:
+        await conn.close()
+
+
+async def _get_ads_historico_v1(args: dict[str, Any], **_: Any) -> str:
     requester = _requester(args)
     if not _is_traffic_allowed(requester):
         return _json({"success": False, "error": "acesso_negado"})
@@ -515,6 +911,45 @@ async def _get_ads_historico(args: dict[str, Any], **_: Any) -> str:
         result = await _aggregate_meta_export(conn, scope_key if scope_type == "group" else None, start, end) or await _aggregate_postgres(conn, accounts, start, end, patterns)
         result.update({"success": True, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end, "data_source": "postgres_history"})
         await _audit(conn, "get_ads_historico", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"spend": result.get("spend"), "leads": result.get("leads"), "accounts": len(accounts)})
+        return _json(result)
+    finally:
+        await conn.close()
+
+
+async def _get_ads_historico(args: dict[str, Any], **_: Any) -> str:
+    start, end = _period(args)
+    group_key = (
+        args.get("group_key")
+        or args.get("grupo")
+        or (args.get("scope_key") if (args.get("scope_type") or "").lower() == "group" else None)
+        or args.get("scope_key")
+    )
+    if not group_key:
+        return _json({
+            "success": False,
+            "erro": "group_key_obrigatorio",
+            "error": "group_key_obrigatorio",
+            "motivo": "Informe group_key ou grupo para consultar ads.daily_insights.",
+            "fonte": "ads.daily_insights",
+        })
+    conn = await _connect()
+    try:
+        result = await _get_ads_historico_core(
+            conn=conn,
+            group_key=str(group_key),
+            start=start,
+            end=end,
+            agrupamento=str(args.get("agrupamento") or "total"),
+            comparar_com=args.get("comparar_com"),
+            requesting_jid=args.get("requesting_jid") or args.get("requester") or args.get("consultante_telefone"),
+            original_prompt=args.get("original_prompt") or args.get("prompt") or args.get("pergunta") or args.get("texto") or "",
+        )
+        await _audit(
+            conn,
+            "get_ads_historico",
+            {**args, "scope_type": "group", "scope_key": group_key, "period_start": start, "period_end": end},
+            {"spend": result.get("spend"), "leads": result.get("leads"), "error": result.get("error")},
+        )
         return _json(result)
     finally:
         await conn.close()
@@ -546,7 +981,7 @@ async def _registrar_input_trafego_periodo(args: dict[str, Any], **_: Any) -> st
         return _json({"success": False, "error": "acesso_negado"})
     start, end = _period(args)
     scope_type = args.get("scope_type") or "group"
-    scope_key = args.get("scope_key") or args.get("grupo") or args.get("mentorada") or args.get("conta")
+    scope_key = args.get("scope_key") or args.get("group_key") or args.get("grupo") or args.get("mentorada") or args.get("conta")
     if not scope_key:
         return _json({"success": False, "error": "scope_key_obrigatorio"})
     conn = await _connect()
@@ -581,7 +1016,363 @@ async def _registrar_input_trafego_periodo(args: dict[str, Any], **_: Any) -> st
 async def _registrar_contratos_periodo(args: dict[str, Any], **kw: Any) -> str:
     if "contracts" not in args and "contratos" not in args:
         return _json({"success": False, "error": "contratos_obrigatorio"})
+    contracts = args.get("contracts") if "contracts" in args else args.get("contratos")
+    try:
+        if int(contracts) <= 0:
+            return _json({"success": False, "error": "contratos_invalidos", "mensagem_para_usuario": "Contratos precisa ser maior que zero para eu salvar esse periodo."})
+    except Exception:
+        return _json({"success": False, "error": "contratos_invalidos", "mensagem_para_usuario": "Nao consegui ler a quantidade de contratos. Me manda um numero inteiro."})
     return await _registrar_input_trafego_periodo(args, **kw)
+
+
+def _first_present(args: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in args and args.get(key) is not None:
+            return args.get(key)
+    return None
+
+
+def _group_key_from_args(args: dict[str, Any]) -> str | None:
+    return _first_present(args, "group_key", "grupo") or (
+        args.get("scope_key") if (args.get("scope_type") or "group").lower() == "group" else None
+    ) or args.get("scope_key")
+
+
+def _contracts_value(value: Any) -> int:
+    try:
+        contracts = int(value)
+    except Exception as exc:
+        raise ValueError("contratos_invalidos") from exc
+    if contracts <= 0:
+        raise ValueError("contratos_zero")
+    return contracts
+
+
+async def _business_key_for_group(conn: asyncpg.Connection, group_key: str, historico: dict[str, Any]) -> str | None:
+    business_key = historico.get("business_key")
+    if business_key:
+        return str(business_key)
+    keys = historico.get("business_keys") or []
+    if len(keys) == 1:
+        return str(keys[0])
+    try:
+        row = await conn.fetchrow("SELECT business_key FROM ads.account_groups WHERE group_key=$1", group_key)
+        if row and row["business_key"]:
+            return str(row["business_key"])
+    except Exception:
+        return None
+    return None
+
+
+async def _contracts_from_period_inputs(
+    conn: asyncpg.Connection,
+    group_key: str,
+    start: date,
+    end: date,
+    offer_key: str | None,
+) -> dict[str, Any] | None:
+    row = await conn.fetchrow(
+        """
+        SELECT contracts, source, created_at, id::text AS input_id
+        FROM ads.period_inputs
+        WHERE scope_type='group'
+          AND scope_key=$1
+          AND COALESCE(offer_key,'') = COALESCE($4,'')
+          AND period_start <= $2::date
+          AND period_end >= $3::date
+          AND COALESCE(is_test, FALSE) = FALSE
+          AND contracts IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        group_key,
+        start,
+        end,
+        offer_key,
+    )
+    if not row:
+        return None
+    return {
+        "contratos": _contracts_value(row["contracts"]),
+        "fonte_contratos": "period_inputs",
+        "detalhe_fonte_contratos": {
+            "input_id": row["input_id"],
+            "source": row["source"],
+            "created_at": row["created_at"],
+        },
+    }
+
+
+async def _table_exists(conn: asyncpg.Connection, schema: str, table: str) -> bool:
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables
+              WHERE table_schema=$1 AND table_name=$2
+            )
+            """,
+            schema,
+            table,
+        )
+    )
+
+
+async def _contracts_from_asaas(conn: asyncpg.Connection, start: date, end: date) -> dict[str, Any] | None:
+    if not await _table_exists(conn, "public", "asaas_event_log"):
+        return None
+    count = await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT payment_id)::int
+        FROM public.asaas_event_log
+        WHERE COALESCE(payment_id, '') <> ''
+          AND (
+            event_type ILIKE '%PAYMENT_RECEIVED%'
+            OR event_type ILIKE '%PAYMENT_CONFIRMED%'
+            OR event_type ILIKE '%PAYMENT_APPROVED%'
+          )
+          AND COALESCE(processed_at, created_at)::date BETWEEN $1::date AND $2::date
+        """,
+        start,
+        end,
+    )
+    if not count:
+        return None
+    return {"contratos": _contracts_value(count), "fonte_contratos": "asaas_event_log"}
+
+
+async def _contracts_from_optional_business_db(
+    conn: asyncpg.Connection,
+    business_key: str | None,
+    group_key: str,
+    start: date,
+    end: date,
+) -> dict[str, Any] | None:
+    key = (business_key or "").lower()
+    if key in {"advogando", "mentorada", "mentoradas"} or group_key.startswith("mentorada"):
+        return await _contracts_from_asaas(conn, start, end)
+    return None
+
+
+def _coverage_block(group_key: str, historico: dict[str, Any]) -> dict[str, Any] | None:
+    parcial = historico.get("coverage_parcial")
+    if not parcial:
+        return None
+    faltantes = parcial.get("contas_faltantes") or []
+    faltantes_msg = ", ".join(str(item) for item in faltantes) if faltantes else "contas sem dado"
+    return {
+        "success": False,
+        "erro": "coverage_parcial",
+        "error": "coverage_parcial",
+        "mensagem_para_usuario": (
+            f"Tenho gasto de {parcial.get('contas_com_dado', 0)} das "
+            f"{parcial.get('contas_esperadas', 0)} contas core em {group_key}. "
+            f"Falta {faltantes_msg}. Quer que eu calcule com as disponíveis ou aguardo?"
+        ),
+        "group_key": group_key,
+        "gasto_parcial": historico.get("gasto_total") or historico.get("spend"),
+        "leads_parcial": historico.get("leads_total") or historico.get("leads"),
+        "contas_faltantes": faltantes,
+        "coverage_parcial": parcial,
+        "fonte_gasto": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+    }
+
+
+async def _metadata_coverage_block(conn: asyncpg.Connection, group_key: str, historico: dict[str, Any]) -> dict[str, Any] | None:
+    expected = CORE_EXPECTED_ACCOUNTS.get(group_key)
+    if not expected:
+        return None
+    try:
+        configured = await conn.fetchval(
+            "SELECT COUNT(DISTINCT ad_account_id)::int FROM ads.account_group_members WHERE group_key=$1",
+            group_key,
+        )
+    except Exception:
+        return None
+    if configured is None:
+        return None
+    configured = int(configured)
+    if configured >= expected:
+        return None
+    missing_count = expected - configured
+    faltantes = [f"{missing_count} conta(s) core ainda fora de ads.account_group_members"]
+    return {
+        "success": False,
+        "erro": "coverage_parcial",
+        "error": "coverage_parcial",
+        "mensagem_para_usuario": (
+            f"Tenho gasto de {configured} das {expected} contas core em {group_key}. "
+            f"Falta cadastrar {missing_count} conta(s) core no cache. Quer que eu calcule com as disponíveis ou aguardo?"
+        ),
+        "group_key": group_key,
+        "gasto_parcial": historico.get("gasto_total") or historico.get("spend"),
+        "leads_parcial": historico.get("leads_total") or historico.get("leads"),
+        "contas_faltantes": faltantes,
+        "coverage_parcial": {
+            "contas_com_dado": configured,
+            "contas_esperadas": expected,
+            "contas_faltantes": faltantes,
+            "motivo": "group_membership_incompleto",
+        },
+        "fonte_gasto": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+    }
+
+
+async def calcular_cac(
+    group_key: str,
+    data_inicio: str,
+    data_fim: str,
+    contratos: int | None = None,
+    requesting_jid: str | None = None,
+    original_prompt: str = "",
+    *,
+    offer_key: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Cruza `get_ads_historico` com contratos sem consultar Meta API diretamente."""
+    start = date.fromisoformat(str(data_inicio)[:10])
+    end = date.fromisoformat(str(data_fim)[:10])
+    historico = await get_ads_historico(
+        group_key=group_key,
+        data_inicio=start.isoformat(),
+        data_fim=end.isoformat(),
+        requesting_jid=requesting_jid,
+        original_prompt=original_prompt,
+    )
+    if not historico.get("success"):
+        return {
+            "success": False,
+            "erro": historico.get("erro") or historico.get("error") or "historico_indisponivel",
+            "error": historico.get("error") or historico.get("erro") or "historico_indisponivel",
+            "group_key": group_key,
+            "periodo": {"inicio": start, "fim": end},
+            "fonte_gasto": "ads.daily_insights",
+            "detalhe_historico": historico,
+        }
+    coverage = _coverage_block(group_key, historico)
+    if coverage:
+        return coverage
+
+    spend = Decimal(str(historico.get("gasto_total") if historico.get("gasto_total") is not None else historico.get("spend") or 0))
+    leads = int(historico.get("leads_total") if historico.get("leads_total") is not None else historico.get("leads") or 0)
+    if spend <= 0:
+        return {
+            "success": False,
+            "erro": "gasto_zero",
+            "error": "gasto_zero",
+            "mensagem_para_usuario": f"Tenho gasto zero em {group_key} nesse periodo. Sem gasto Meta, CAC nao e causal.",
+            "group_key": group_key,
+            "periodo": {"inicio": start, "fim": end},
+            "gasto_total": spend,
+            "leads_total": leads,
+            "fonte_gasto": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+        }
+
+    contratos_info: dict[str, Any] | None = None
+    if contratos is not None:
+        try:
+            contratos_info = {"contratos": _contracts_value(contratos), "fonte_contratos": "manual_param"}
+        except ValueError:
+            return {
+                "success": False,
+                "erro": "contratos_zero",
+                "error": "contratos_zero",
+                "mensagem_para_usuario": f"Contratos precisa ser maior que zero para calcular CAC em {group_key}.",
+                "group_key": group_key,
+                "periodo": {"inicio": start, "fim": end},
+                "gasto_total": spend,
+                "fonte_gasto": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+                "fonte_contratos": "manual_param",
+            }
+
+    conn = await _connect()
+    try:
+        metadata_coverage = await _metadata_coverage_block(conn, group_key, historico)
+        if metadata_coverage:
+            await _audit(conn, "calcular_cac", {"group_key": group_key, "period_start": start, "period_end": end}, {"error": "coverage_parcial", "source": "group_membership"})
+            return metadata_coverage
+        business_key = await _business_key_for_group(conn, group_key, historico)
+        if contratos_info is None:
+            contratos_info = await _contracts_from_period_inputs(conn, group_key, start, end, offer_key)
+        if contratos_info is None:
+            contratos_info = await _contracts_from_optional_business_db(conn, business_key, group_key, start, end)
+        if contratos_info is None:
+            result = {
+                "success": False,
+                "erro": "contratos_ausentes",
+                "error": "contratos_ausentes",
+                "mensagem_para_usuario": f"Nao tenho contratos pra esse periodo em {group_key}. Quantos foram?",
+                "group_key": group_key,
+                "business_key": business_key,
+                "periodo": {"inicio": start, "fim": end},
+                "gasto_total": spend,
+                "leads_total": leads,
+                "fonte_gasto": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+                "fonte_contratos": "missing",
+            }
+            await _audit(conn, "calcular_cac", {"group_key": group_key, "period_start": start, "period_end": end}, {"error": "contratos_ausentes", "spend": spend, "leads": leads})
+            return result
+
+        contracts_i = int(contratos_info["contratos"])
+        cpl = (spend / Decimal(leads)).quantize(Decimal("0.01")) if leads > 0 else None
+        conversion = ((Decimal(contracts_i) / Decimal(leads)) * Decimal("100")).quantize(Decimal("0.01")) if leads > 0 else None
+        cac = (spend / Decimal(contracts_i)).quantize(Decimal("0.01"))
+        result = {
+            "success": True,
+            "group_key": group_key,
+            "scope_type": "group",
+            "scope_key": group_key,
+            "business_key": business_key,
+            "periodo": {"inicio": start, "fim": end},
+            "period_start": start,
+            "period_end": end,
+            "gasto_total": spend,
+            "leads_total": leads,
+            "contratos": contracts_i,
+            "fonte_contratos": contratos_info["fonte_contratos"],
+            "detalhe_fonte_contratos": contratos_info.get("detalhe_fonte_contratos"),
+            "cac": cac,
+            "cpl": cpl,
+            "conversao_pct": conversion,
+            "conversion_rate": conversion,
+            "atualizado_em": datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds"),
+            "fonte_gasto": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+            "ads_source": historico.get("fonte") or historico.get("data_source") or "ads.daily_insights",
+            "spend": spend,
+            "leads": leads,
+            "contracts": contracts_i,
+            "accounts": historico.get("series") if historico.get("agrupamento") == "conta" else [],
+        }
+        if not dry_run:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO ads.period_metrics(scope_type, scope_key, offer_key, period_start, period_end, spend, impressions, clicks, leads, contracts, cpl, cac, conversion_rate, data_source, raw_json)
+                    VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
+                    """,
+                    "group",
+                    group_key,
+                    offer_key,
+                    start,
+                    end,
+                    spend,
+                    historico.get("impressions_total") or historico.get("impressions") or 0,
+                    historico.get("clicks_total") or historico.get("clicks") or 0,
+                    leads,
+                    contracts_i,
+                    cpl,
+                    cac,
+                    conversion,
+                    result["fonte_gasto"],
+                    json.dumps(result, ensure_ascii=False, default=_json_default),
+                )
+            except Exception as exc:
+                result["period_metrics_note"] = f"metricas_nao_persistidas: {str(exc)[:160]}"
+        await _audit(conn, "calcular_cac", {"group_key": group_key, "period_start": start, "period_end": end}, {"spend": spend, "leads": leads, "contracts": contracts_i, "cac": cac})
+        return result
+    finally:
+        await conn.close()
 
 
 async def _calcular_cac(args: dict[str, Any], **_: Any) -> str:
@@ -589,99 +1380,26 @@ async def _calcular_cac(args: dict[str, Any], **_: Any) -> str:
     if not _is_traffic_allowed(requester):
         return _json({"success": False, "error": "acesso_negado"})
     start, end = _period(args)
-    scope_type = args.get("scope_type") or ("group" if args.get("grupo") else "mentee" if args.get("mentorada") else "account" if args.get("conta") else None)
-    scope_key = args.get("scope_key") or args.get("grupo") or args.get("mentorada") or args.get("conta")
-    offer_key = args.get("offer_key") or args.get("oferta")
-    conn = await _connect()
-    try:
-        accounts = await _resolve_accounts(conn, scope_type, scope_key, args.get("q"))
-        patterns = await _offer_patterns(conn, args.get("grupo") or (scope_key if scope_type == "group" else None), offer_key)
-        if offer_key and not patterns:
-            result = _offer_mapping_missing_result(scope_type, scope_key, offer_key, start, end)
-            await _audit(conn, "calcular_cac", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"error": "offer_mapping_missing"})
-            return _json(result)
-        ads = await _aggregate_meta_export(conn, scope_key if scope_type == "group" else None, start, end) or await _aggregate_postgres(conn, accounts, start, end, patterns)
-        api_refresh_note = None
-        if bool(args.get("refresh") or args.get("usar_api_meta")):
-            api_limit = int(args.get("api_limit") or 3)
-            if accounts and len(accounts) <= api_limit:
-                api_ads = await _fetch_meta_api(accounts, start, end, level=str(args.get("level") or "campaign"))
-                if not api_ads.get("errors") and (api_ads.get("spend") or api_ads.get("leads")):
-                    ads = api_ads
-                    api_refresh_note = "metricas_atualizadas_via_meta_api"
-                else:
-                    api_refresh_note = f"meta_api_indisponivel_ou_sem_dados: {len(api_ads.get('errors') or [])} erro(s)"
-            else:
-                api_refresh_note = f"meta_api_nao_chamada: escopo tem {len(accounts)} conta(s), limite {api_limit}"
-        latest = await conn.fetchrow(
-            """
-            SELECT * FROM ads.v_period_inputs_latest
-            WHERE scope_type=$1 AND scope_key=$2 AND COALESCE(offer_key,'') = COALESCE($3,'')
-              AND period_start=$4::date AND period_end=$5::date
-            """,
-            scope_type,
-            scope_key,
-            offer_key,
-            start,
-            end,
-        )
-        inp = dict(latest) if latest else {}
-        contracts = args.get("contracts") or args.get("contratos") or inp.get("contracts")
-        budget = args.get("budget") or args.get("orcamento") or inp.get("budget")
-        projected = args.get("projected_revenue") or args.get("faturamento_projetado") or inp.get("projected_revenue")
-        actual = args.get("actual_revenue") or args.get("faturamento_real") or inp.get("actual_revenue")
-        spend = Decimal(str(ads.get("spend") or 0))
-        leads = int(ads.get("leads") or 0)
-        contracts_i = int(contracts or 0) if contracts is not None else None
-        cpl = (spend / Decimal(leads)).quantize(Decimal("0.01")) if leads else None
-        cac = (spend / Decimal(contracts_i)).quantize(Decimal("0.01")) if contracts_i else None
-        conversion = ((Decimal(contracts_i) / Decimal(leads)) * Decimal("100")).quantize(Decimal("0.01")) if contracts_i and leads else None
-        revenue_for_roi = actual if actual not in (None, "") else projected
-        roi = (Decimal(str(revenue_for_roi)) / spend).quantize(Decimal("0.01")) if revenue_for_roi not in (None, "") and spend else None
-        masked = (not _is_admin(requester)) and scope_type in {"group", "business"} and scope_key in {"des", "advogando_adn"}
-        ads_source = ads.get("data_source", "postgres_history")
-        result = {
-            "success": True,
-            "scope_type": scope_type,
-            "scope_key": scope_key,
-            "offer_key": offer_key,
-            "period_start": start,
-            "period_end": end,
-            "spend": spend,
-            "leads": leads,
-            "contracts": contracts_i,
-            "budget": budget,
-            "projected_revenue": None if masked else projected,
-            "actual_revenue": None if masked else actual,
-            "cpl": cpl,
-            "cac": cac,
-            "conversion_rate": conversion,
-            "roi": None if masked else roi,
-            "finance_masked": masked,
-            "input_source": "args" if (args.get("contracts") or args.get("contratos")) else ("period_inputs" if inp else "missing"),
-            "ads_source": ads_source,
-            "accounts": ads.get("by_account", []),
-            "notes": [] if contracts_i else ["Sem contratos no periodo; informe contratos para calcular CAC e conversao."],
-        }
-        if api_refresh_note:
-            result["notes"].append(api_refresh_note)
-        if ads.get("errors"):
-            result["meta_api_errors"] = ads.get("errors")
-        if not bool(args.get("dry_run") or False):
-            await conn.execute(
-                """
-                INSERT INTO ads.period_metrics(scope_type, scope_key, offer_key, period_start, period_end, spend, impressions, clicks, leads, contracts, budget, projected_revenue, actual_revenue, cpl, cac, conversion_rate, roi, data_source, raw_json)
-                VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb)
-                """,
-                scope_type, scope_key, offer_key, start, end, spend, ads.get("impressions") or 0, ads.get("clicks") or 0, leads, contracts_i, budget, projected, actual, cpl, cac, conversion, roi, ads_source, json.dumps(result, ensure_ascii=False, default=_json_default)
-            )
-        await _audit(conn, "calcular_cac", {**args, "scope_type": scope_type, "scope_key": scope_key, "offer_key": offer_key, "period_start": start, "period_end": end}, {"spend": spend, "leads": leads, "contracts": contracts_i, "cac": cac})
-        return _json(result)
-    finally:
-        await conn.close()
+    group_key = _group_key_from_args(args)
+    if not group_key:
+        return _json({"success": False, "erro": "group_key_obrigatorio", "error": "group_key_obrigatorio", "mensagem_para_usuario": "Informe o grupo do trafego, por exemplo DES."})
+    contratos = _first_present(args, "contracts", "contratos")
+    result = await calcular_cac(
+        group_key=str(group_key),
+        data_inicio=start.isoformat(),
+        data_fim=end.isoformat(),
+        contratos=contratos,
+        requesting_jid=args.get("requesting_jid") or args.get("requester") or args.get("consultante_telefone"),
+        original_prompt=args.get("original_prompt") or args.get("prompt") or args.get("pergunta") or args.get("texto") or "",
+        offer_key=args.get("offer_key") or args.get("oferta"),
+        dry_run=bool(args.get("dry_run") or False),
+    )
+    return _json(result)
 
 
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    if ImageFont is None:
+        raise RuntimeError("Pillow nao esta instalado; geracao de card indisponivel neste ambiente.")
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -699,6 +1417,8 @@ def _draw_center(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font
 
 
 def _draw_card(metric: dict[str, Any], title: str, period_label: str, scope_label: str, output: Path) -> None:
+    if Image is None:
+        raise RuntimeError("Pillow nao esta instalado; geracao de card indisponivel neste ambiente.")
     W, H = 630, 1280
     img = Image.new("RGB", (W, H), "#10203a")
     d = ImageDraw.Draw(img)
@@ -784,11 +1504,11 @@ async def _gestor_trafego_responder(args: dict[str, Any], **_: Any) -> str:
 
 HEALTH_SCHEMA = {"name": "ads_historico_health", "description": "Mostra saude do historico Meta Ads, grupos, funil e inputs salvos para CAC.", "parameters": {"type": "object", "properties": {}, "required": []}}
 RESOLVER_SCHEMA = {"name": "resolver_agrupamento_meta", "description": "Resolve grupos/contas/ofertas Meta Ads: des, mentoradas_100k, advogando_adn, TAG, Advogando 25K, mentorada por nome.", "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "scope_type": {"type": "string"}, "scope_key": {"type": "string"}}, "required": []}}
-HIST_SCHEMA = {"name": "get_ads_historico", "description": "Busca historico Meta Ads salvo no Postgres por periodo exato. Use para mensal, anual, mes a mes, mentorada, grupo ou oferta.", "parameters": {"type": "object", "properties": {"scope_type": {"type": "string", "enum": ["group", "account", "business", "mentee"]}, "scope_key": {"type": "string"}, "grupo": {"type": "string"}, "mentorada": {"type": "string"}, "conta": {"type": "string"}, "offer_key": {"type": "string"}, "oferta": {"type": "string"}, "data_inicio": {"type": "string"}, "data_fim": {"type": "string"}, "q": {"type": "string"}, "requester": {"type": "string"}}, "required": ["data_inicio", "data_fim"]}}
+HIST_SCHEMA = {"name": "get_ads_historico", "description": "Busca historico Meta Ads exclusivamente no Postgres ads.daily_insights por group_key, com agrupamento e comparativo automatico.", "parameters": {"type": "object", "properties": {"group_key": {"type": "string", "description": "Grupo ads.account_groups, ex: des, advogando_adn, mentoradas_100k"}, "agrupamento": {"type": "string", "enum": ["total", "dia", "semana", "conta"], "default": "total"}, "comparar_com": {"type": "string", "enum": ["periodo_anterior", "ano_anterior"]}, "requesting_jid": {"type": "string"}, "original_prompt": {"type": "string"}, "prompt": {"type": "string"}, "pergunta": {"type": "string"}, "scope_type": {"type": "string", "enum": ["group", "account", "business", "mentee"]}, "scope_key": {"type": "string"}, "grupo": {"type": "string"}, "mentorada": {"type": "string"}, "conta": {"type": "string"}, "offer_key": {"type": "string"}, "oferta": {"type": "string"}, "data_inicio": {"type": "string"}, "data_fim": {"type": "string"}, "q": {"type": "string"}, "requester": {"type": "string"}}, "required": ["data_inicio", "data_fim"]}}
 API_SCHEMA = {"name": "get_meta_ads_periodo", "description": "Consulta a API do Meta para periodo exato por conta/grupo. Use quando o cache nao cobre o periodo, por exemplo abril inteiro.", "parameters": {"type": "object", "properties": {"scope_type": {"type": "string"}, "scope_key": {"type": "string"}, "grupo": {"type": "string"}, "conta": {"type": "string"}, "data_inicio": {"type": "string"}, "data_fim": {"type": "string"}, "level": {"type": "string", "enum": ["campaign", "adset", "ad"]}, "limit": {"type": "integer"}, "q": {"type": "string"}, "requester": {"type": "string"}}, "required": ["data_inicio", "data_fim"]}}
-INPUT_SCHEMA = {"name": "registrar_input_trafego_periodo", "description": "Salva inputs conversacionais de trafego: contratos, orcamento, faturamento projetado/real e observacoes por periodo.", "parameters": {"type": "object", "properties": {"scope_type": {"type": "string"}, "scope_key": {"type": "string"}, "grupo": {"type": "string"}, "mentorada": {"type": "string"}, "conta": {"type": "string"}, "offer_key": {"type": "string"}, "oferta": {"type": "string"}, "data_inicio": {"type": "string"}, "data_fim": {"type": "string"}, "contracts": {"type": "integer"}, "contratos": {"type": "integer"}, "budget": {"type": "number"}, "orcamento": {"type": "number"}, "projected_revenue": {"type": "number"}, "faturamento_projetado": {"type": "number"}, "actual_revenue": {"type": "number"}, "faturamento_real": {"type": "number"}, "notes": {"type": "string"}, "source_message": {"type": "string"}, "requester": {"type": "string"}, "is_test": {"type": "boolean"}, "dry_run": {"type": "boolean"}}, "required": ["data_inicio", "data_fim"]}}
-CONTRATOS_SCHEMA = {**INPUT_SCHEMA, "name": "registrar_contratos_periodo", "description": "Atalho para salvar contratos fechados no periodo, usado pelo CAC."}
-CAC_SCHEMA = {"name": "calcular_cac", "description": "Calcula CAC, conversao, CPL e ROI cruzando gasto Meta Ads do periodo com contratos/orcamento/faturamento informados ou salvos.", "parameters": INPUT_SCHEMA["parameters"]}
+INPUT_SCHEMA = {"name": "registrar_input_trafego_periodo", "description": "Salva inputs conversacionais de trafego: contratos, orcamento, faturamento projetado/real e observacoes por periodo.", "parameters": {"type": "object", "properties": {"group_key": {"type": "string", "description": "Grupo ads.account_groups, ex: des, advogando_adn, mentoradas_100k"}, "scope_type": {"type": "string"}, "scope_key": {"type": "string"}, "grupo": {"type": "string"}, "mentorada": {"type": "string"}, "conta": {"type": "string"}, "offer_key": {"type": "string"}, "oferta": {"type": "string"}, "data_inicio": {"type": "string"}, "data_fim": {"type": "string"}, "contracts": {"type": "integer"}, "contratos": {"type": "integer"}, "budget": {"type": "number"}, "orcamento": {"type": "number"}, "projected_revenue": {"type": "number"}, "faturamento_projetado": {"type": "number"}, "actual_revenue": {"type": "number"}, "faturamento_real": {"type": "number"}, "notes": {"type": "string"}, "source_message": {"type": "string"}, "requester": {"type": "string"}, "requesting_jid": {"type": "string"}, "original_prompt": {"type": "string"}, "prompt": {"type": "string"}, "pergunta": {"type": "string"}, "is_test": {"type": "boolean"}, "dry_run": {"type": "boolean"}}, "required": ["data_inicio", "data_fim"]}}
+CONTRATOS_SCHEMA = {**INPUT_SCHEMA, "name": "registrar_contratos_periodo", "description": "Atalho para salvar contratos fechados no periodo, usado pelo CAC. Exige contratos > 0."}
+CAC_SCHEMA = {"name": "calcular_cac", "description": "Calcula CAC, conversao e CPL lendo gasto via get_ads_historico/ads.daily_insights e contratos por parametro, period_inputs ou fonte de negocio. Bloqueia coverage_parcial.", "parameters": INPUT_SCHEMA["parameters"]}
 CARD_SCHEMA = {"name": "gerar_card_trafego_periodo", "description": "Gera imagem PNG do resultado parcial de trafego no formato card visual das mentoradas/Advogando 100K.", "parameters": {"type": "object", "properties": {**INPUT_SCHEMA["parameters"]["properties"], "titulo": {"type": "string"}, "nome": {"type": "string"}, "periodo_label": {"type": "string"}}, "required": ["data_inicio", "data_fim"]}}
 GESTOR_SCHEMA = {"name": "gestor_trafego_responder", "description": "Orquestrador conversacional do subagente gestor de trafego: historico, CAC e card conforme pedido do usuario.", "parameters": {"type": "object", "properties": {**INPUT_SCHEMA["parameters"]["properties"], "gerar_card": {"type": "boolean"}, "titulo": {"type": "string"}, "periodo_label": {"type": "string"}}, "required": ["data_inicio", "data_fim"]}}
 

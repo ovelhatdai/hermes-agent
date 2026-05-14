@@ -660,6 +660,13 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
+            # Register controlled-write approval handlers used by SPEC-125.
+            for _action_id in (
+                "hermes_write_approve",
+                "hermes_write_deny",
+            ):
+                self._app.action(_action_id)(self._handle_controlled_write_action)
+
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
             _apply_slack_proxy(self._handler.client, proxy_url)
@@ -2551,6 +2558,81 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
 
         # (approval state already consumed by atomic pop above)
+
+    async def _handle_controlled_write_action(self, ack, body, action) -> None:
+        """Handle SPEC-125 controlled-write approval buttons."""
+        await ack()
+
+        action_id = action.get("action_id", "")
+        controlled_action_id = action.get("value", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+        choice = "approve" if action_id == "hermes_write_approve" else "deny"
+
+        helper_path = os.getenv("HERMES_SLACK_EVENTS_PATH", "/opt/hermes-slack-events")
+        if helper_path and helper_path not in sys.path:
+            sys.path.insert(0, helper_path)
+
+        try:
+            from controlled_writes import message_for_result, resolve_controlled_action
+
+            result = resolve_controlled_action(
+                controlled_action_id,
+                choice,
+                approved_by=user_id,
+                approver_name=user_name,
+                channel=channel_id,
+            )
+            decision_text = message_for_result(result)
+        except Exception as exc:
+            logger.error("Failed to resolve controlled Slack write action: %s", exc, exc_info=True)
+            result = {"ok": False, "status": "failed", "error": str(exc)}
+            decision_text = f"Acao controlada falhou: {exc}"
+
+        original_text = ""
+        for block in message.get("blocks", []):
+            if block.get("type") == "section":
+                original_text = block.get("text", {}).get("text", "")
+                break
+
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": original_text or "Controlled write request",
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": decision_text},
+                ],
+            },
+        ]
+
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=decision_text,
+                blocks=updated_blocks,
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to update controlled-write message: %s", e)
+
+        if result.get("status") in {"executed", "blocked", "denied"}:
+            try:
+                post_kwargs: Dict[str, Any] = {"channel": channel_id, "text": decision_text}
+                thread_ts = message.get("thread_ts") or msg_ts
+                if thread_ts:
+                    post_kwargs["thread_ts"] = thread_ts
+                await self._get_client(channel_id).chat_postMessage(**post_kwargs)
+            except Exception as e:
+                logger.warning("[Slack] Failed to post controlled-write result: %s", e)
 
     # ----- Thread context fetching -----
 
