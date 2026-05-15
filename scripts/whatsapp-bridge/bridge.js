@@ -184,10 +184,10 @@ function rememberSentFeedbackHash(sent, message) {
   }
 }
 
-function trackSentMessageId(sent) {
+function trackSentMessageId(sent, msg) {
   if (sent?.key?.id) {
     recentlySentIds.add(sent.key.id);
-    rememberSentFeedbackHash(sent, message);
+    rememberSentFeedbackHash(sent, msg || null);
     if (recentlySentIds.size > MAX_RECENT_IDS) {
       recentlySentIds.delete(recentlySentIds.values().next().value);
     }
@@ -681,7 +681,7 @@ async function sendTextMessage(chatId, message) {
 
   if (sent?.key?.id) {
     recentlySentIds.add(sent.key.id);
-    rememberSentFeedbackHash(sent, message);
+    rememberSentFeedbackHash(sent, message || null);
     if (recentlySentIds.size > MAX_RECENT_IDS) {
       recentlySentIds.delete(recentlySentIds.values().next().value);
     }
@@ -899,7 +899,7 @@ app.post('/send-media', async (req, res) => {
 
     const sent = await sock.sendMessage(chatId, msgPayload);
 
-    trackSentMessageId(sent);
+    trackSentMessageId(sent, null);
 
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
