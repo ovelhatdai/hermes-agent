@@ -137,9 +137,26 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
+// Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
+// when uploading media to WhatsApp servers (and, less often, on text sends),
+// which pins the bridge's HTTP handler until the upstream aiohttp timeout
+// fires. Fail fast instead so the gateway can surface a real error and retry.
+const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
+    .finally(() => clearTimeout(timer));
 }
 
 function formatOutgoingMessage(message) {
@@ -504,7 +521,10 @@ async function startSocket() {
       const messageContent = getMessageContent(msg);
       const contextInfo = getContextInfo(messageContent);
       const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
-      let quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || contextInfo?.remoteJid || '');
+      const quotedMessageId = contextInfo?.stanzaId || null;
+      let quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || contextInfo?.remoteJid || '') || null;
+      const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
+      const hasQuotedMessage = !!contextInfo?.quotedMessage;
       let quotedText = extractQuotedText(messageContent);
 
       // Extract message body
@@ -648,8 +668,11 @@ async function startSocket() {
         mediaType,
         mediaUrls,
         mentionedIds,
+        quotedMessageId,
         quotedParticipant,
         quotedText,
+        quotedRemoteJid,
+        hasQuotedMessage,
         botIds,
         timestamp: msg.messageTimestamp,
       };
@@ -715,7 +738,9 @@ app.post('/send', async (req, res) => {
     const chunks = splitLongMessage(message);
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendTextMessage(chatId, chunks[i]);
+      const sent = await sendWithTimeout(chatId, { text: formatOutgoingMessage(chunks[i]), linkPreview: null });
+      chipManagerBridge.rememberOutgoingAlert(chatId, chunks[i]);
+      trackSentMessageId(sent, chunks[i]);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
@@ -790,14 +815,12 @@ app.post('/edit', async (req, res) => {
     const chunks = splitLongMessage(message);
     const messageIds = [];
 
-    await sock.sendMessage(chatId, {
-      text: formatOutgoingMessage(chunks[0]),
-      edit: key,
-      linkPreview: null,
-    });
+    await sendWithTimeout(chatId, { text: formatOutgoingMessage(chunks[0]), edit: key, linkPreview: null });
     if (chunks.length > 1) {
       for (let i = 1; i < chunks.length; i += 1) {
-        const sent = await sendTextMessage(chatId, chunks[i]);
+        const sent = await sendWithTimeout(chatId, { text: formatOutgoingMessage(chunks[i]), linkPreview: null });
+        chipManagerBridge.rememberOutgoingAlert(chatId, chunks[i]);
+        trackSentMessageId(sent, chunks[i]);
         if (sent?.key?.id) messageIds.push(sent.key.id);
         if (i < chunks.length - 1) {
           await sleep(CHUNK_DELAY_MS);
@@ -897,7 +920,7 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sock.sendMessage(chatId, msgPayload);
+    const sent = await sendWithTimeout(chatId, msgPayload);
 
     trackSentMessageId(sent, null);
 
