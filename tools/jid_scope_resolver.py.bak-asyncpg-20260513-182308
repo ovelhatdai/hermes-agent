@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""JID permission resolver for SPEC-163 traffic tools."""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+import psycopg2
+import requests
+
+LOGGER = logging.getLogger(__name__)
+
+STAFF_HARDCODED = {
+    "5551991987972": ("Vinicius", "staff"),
+    "5551984213925": ("Daiane", "staff"),
+    "5551989150954": ("Diulia", "staff"),
+    "5551980148849": ("Joao Marques", "staff"),
+}
+
+COMPARATIVO_TRIGGERS = [
+    "comparada com",
+    "comparado com",
+    "como tô comparada",
+    "como to comparada",
+    "comparando com",
+    "vs a",
+    "vs o",
+    "versus",
+    "top ",
+    "ranking",
+    "melhor que",
+]
+
+RESPOSTA_BLOQUEIO_COMPARATIVO = (
+    "Só posso te falar dos teus números. "
+    "Se quiser comparativo, fala com a Diulia."
+)
+
+ALERT_CACHE_PATH = Path(os.getenv("ADS_SCOPE_ALERT_CACHE", "/var/lib/hermes-ads/scope_alerts.json"))
+ALERT_RATE_LIMIT_SECONDS = 24 * 60 * 60
+ALERT_JID_VINI = os.getenv("ALERT_JID_VINI", "5551991987972")
+ENV_FILES = (
+    Path("/etc/hermes-ads/.env"),
+    Path("/etc/meta-ads-relatorio/env"),
+    Path("/etc/hermes/bridge-url.env"),
+)
+
+
+def _load_env_files() -> None:
+    for path in ENV_FILES:
+        try:
+            if not path.exists():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        except Exception as exc:
+            LOGGER.debug("failed to load env file %s: %s", path, exc)
+
+
+def normalize_jid(jid: Any) -> str:
+    """Normalize WhatsApp JID to digits, removing @lid and @s.whatsapp.net suffixes."""
+    raw = str(jid or "").strip()
+    if not raw:
+        return ""
+    local = raw.split("@", 1)[0]
+    digits = re.sub(r"\D", "", local)
+    if len(digits) == 11 and not digits.startswith("55"):
+        digits = "55" + digits
+    return digits
+
+
+def _db_connect():
+    _load_env_files()
+    db_url = (
+        os.getenv("HERMES_ADS_DATABASE_URL")
+        or os.getenv("ADS_DATABASE_URL")
+        or os.getenv("HERMES_DB_URL")
+        or os.getenv("DATABASE_URL")
+    )
+    if db_url:
+        return psycopg2.connect(db_url, connect_timeout=4)
+    return psycopg2.connect(
+        host=os.getenv("PGHOST", "127.0.0.1"),
+        port=os.getenv("PGPORT", "5432"),
+        dbname=os.getenv("PGDATABASE", "hermes"),
+        user=os.getenv("PGUSER", "postgres"),
+        password=os.getenv("PGPASSWORD"),
+        connect_timeout=4,
+    )
+
+
+def _coerce_allowed_groups(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if isinstance(value, tuple):
+        return [str(item) for item in value if item]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("{") and stripped.endswith("}"):
+            return [part.strip().strip('"') for part in stripped[1:-1].split(",") if part.strip()]
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if item]
+        except Exception:
+            pass
+        return [stripped]
+    return [str(value)]
+
+
+def _fetch_scope_from_db(normalized_jid: str) -> dict[str, Any] | None:
+    if not normalized_jid:
+        return None
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT jid, person_name, person_type, allowed_groups
+                    FROM ads.jid_scope
+                    WHERE jid = %s
+                       OR jid = %s
+                       OR jid = %s
+                       OR regexp_replace(jid, '\\D', '', 'g') = %s
+                    LIMIT 1
+                    """,
+                    (
+                        normalized_jid,
+                        f"{normalized_jid}@lid",
+                        f"{normalized_jid}@s.whatsapp.net",
+                        normalized_jid,
+                    ),
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        LOGGER.warning("ads.jid_scope unavailable; using hardcoded fallback: %s", exc)
+        return None
+    if not row:
+        return None
+    _, person_name, person_type, allowed_groups = row
+    allowed = _coerce_allowed_groups(allowed_groups)
+    if person_type == "staff" and not allowed:
+        allowed = ["*"]
+    if person_type == "funcionario" and not allowed:
+        allowed = ["des"]
+    return {
+        "person_type": str(person_type or "unknown"),
+        "allowed_groups": allowed,
+        "block": False,
+        "alerta_vini": False,
+        "person_name": person_name,
+        "source": "ads.jid_scope",
+    }
+
+
+def _load_alert_cache() -> dict[str, float]:
+    try:
+        if not ALERT_CACHE_PATH.exists():
+            return {}
+        raw = json.loads(ALERT_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): float(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _save_alert_cache(cache: dict[str, float]) -> None:
+    ALERT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ALERT_CACHE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(ALERT_CACHE_PATH)
+
+
+def _bridge_send_url() -> str:
+    _load_env_files()
+    explicit = os.getenv("HERMES_BRIDGE_SEND_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    base = os.getenv("HERMES_BRIDGE_URL") or os.getenv("HERMES_BRIDGE") or "http://127.0.0.1:3000"
+    return base.rstrip("/") + "/send"
+
+
+def _alert_unknown_jid(jid_completo: Any, normalized_jid: str, original_prompt: str = "") -> bool:
+    cache_key = normalized_jid or str(jid_completo or "unknown")
+    now = time.time()
+    cache = _load_alert_cache()
+    last_sent = float(cache.get(cache_key) or 0)
+    if now - last_sent < ALERT_RATE_LIMIT_SECONDS:
+        return False
+    text = f"🚨 JID desconhecido tentou consultar tráfego: {jid_completo}. Prompt: {(original_prompt or '')[:200]}"
+    try:
+        response = requests.post(
+            _bridge_send_url(),
+            json={"to": ALERT_JID_VINI, "text": text},
+            timeout=5,
+        )
+        response.raise_for_status()
+        cache[cache_key] = now
+        _save_alert_cache(cache)
+        return True
+    except Exception as exc:
+        LOGGER.warning("failed to alert unknown traffic JID %s: %s", jid_completo, exc)
+        return False
+
+
+def _has_comparative_prompt(original_prompt: str) -> bool:
+    text = (original_prompt or "").lower()
+    return any(trigger in text for trigger in COMPARATIVO_TRIGGERS)
+
+
+def resolve_scope(jid: str, original_prompt: str = "") -> dict[str, Any]:
+    normalized = normalize_jid(jid)
+    scope = _fetch_scope_from_db(normalized)
+    if scope is None and normalized in STAFF_HARDCODED:
+        person_name, person_type = STAFF_HARDCODED[normalized]
+        scope = {
+            "person_type": person_type,
+            "allowed_groups": ["*"],
+            "block": False,
+            "alerta_vini": False,
+            "person_name": person_name,
+            "source": "hardcoded_staff",
+        }
+    if scope is None:
+        alert_sent = _alert_unknown_jid(jid, normalized, original_prompt)
+        LOGGER.warning("blocking unknown JID for traffic scope: jid=%s normalized=%s", jid, normalized)
+        return {
+            "person_type": "unknown",
+            "allowed_groups": [],
+            "block": True,
+            "alerta_vini": True,
+            "alert_sent": alert_sent,
+            "block_comparative": False,
+            "person_name": None,
+            "requesting_jid": jid,
+            "normalized_jid": normalized,
+            "source": "blocked_unknown",
+        }
+    scope.setdefault("allowed_groups", [])
+    scope.setdefault("block", False)
+    scope.setdefault("alerta_vini", False)
+    scope["requesting_jid"] = jid
+    scope["normalized_jid"] = normalized
+    scope["block_comparative"] = bool(
+        scope.get("person_type") == "mentorada" and _has_comparative_prompt(original_prompt)
+    )
+    return scope

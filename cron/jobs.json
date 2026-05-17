@@ -1,0 +1,254 @@
+{
+  "jobs": [
+    {
+      "id": "d72b4e782401",
+      "name": "Briefing Matinal",
+      "prompt": "Coleta dados de todas as APIs disponiveis e monta um briefing matinal completo para o Vinicius.\nInclui: status dos bots (via http://localhost:9104/bots), engajamento mentoradas (via http://localhost:9090/api/groups/status), \nmetricas comerciais DES (via http://localhost:9093/api/resumo-dia), alertas criticos.\nFormato: direto, sem floreio, dados concretos. Comeca com \"Bom dia. Panorama de hoje:\"\nSe algo estiver fora do normal, destaca PRIMEIRO.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "30 7 * * 1-5",
+        "display": "30 7 * * 1-5"
+      },
+      "schedule_display": "30 7 * * 1-5",
+      "repeat": {
+        "times": null,
+        "completed": 21
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-04-13T09:26:13.993231-03:00",
+      "next_run_at": "2026-05-04T07:30:00-03:00",
+      "last_run_at": "2026-05-01T07:32:29.460419-03:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "whatsapp",
+      "origin": {
+        "platform": "whatsapp",
+        "chat_id": "5551991987972@s.whatsapp.net"
+      }
+    },
+    {
+      "id": "ef57c1a4a125",
+      "name": "Ciclo Cobranca Manha",
+      "prompt": "Verifica tarefas pendentes do kanban e cobra os responsaveis.\nLista tarefas atrasadas ou paradas, identifica quem deve resolver, e manda cobranca direta.\nFormato: lista curta, nome da pessoa + tarefa + deadline. Tom: gerente impaciente.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "30 11 * * 1-5",
+        "display": "30 11 * * 1-5"
+      },
+      "schedule_display": "30 11 * * 1-5",
+      "repeat": {
+        "times": null,
+        "completed": 15
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-04-13T09:26:13.998778-03:00",
+      "next_run_at": "2026-05-04T11:30:00-03:00",
+      "last_run_at": "2026-05-01T11:32:40.713041-03:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "whatsapp",
+      "origin": {
+        "platform": "whatsapp",
+        "chat_id": "5551991987972@s.whatsapp.net"
+      }
+    },
+    {
+      "id": "6072c92ab394",
+      "name": "Ciclo Cobranca Tarde",
+      "prompt": "Segundo ciclo de cobranca do dia. Verifica tarefas que ainda nao foram resolvidas desde a manha.\nSe algo foi feito, reconhece brevemente. Se nao, aumenta pressao.\nTom: mais impaciente que o da manha.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 15 * * 1-5",
+        "display": "0 15 * * 1-5"
+      },
+      "schedule_display": "0 15 * * 1-5",
+      "repeat": {
+        "times": null,
+        "completed": 15
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-04-13T09:26:14.006460-03:00",
+      "next_run_at": "2026-05-04T15:00:00-03:00",
+      "last_run_at": "2026-05-01T15:03:33.567732-03:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "whatsapp",
+      "origin": {
+        "platform": "whatsapp",
+        "chat_id": "5551991987972@s.whatsapp.net"
+      }
+    },
+    {
+      "id": "0c0c3bdf578f",
+      "name": "Check Tarefas Stale",
+      "prompt": "Final do expediente. Verifica tarefas que ficaram stale (sem movimento >24h).\nLista as 5 mais criticas. Sugere prioridades pro proximo dia.\nTom: pragmatico, \"isso aqui precisa de decisao amanha\".",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 18 * * 1-5",
+        "display": "0 18 * * 1-5"
+      },
+      "schedule_display": "0 18 * * 1-5",
+      "repeat": {
+        "times": null,
+        "completed": 18
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-04-13T09:26:14.010990-03:00",
+      "next_run_at": "2026-05-04T18:00:00-03:00",
+      "last_run_at": "2026-05-01T18:02:26.058492-03:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "whatsapp",
+      "origin": {
+        "platform": "whatsapp",
+        "chat_id": "5551991987972@s.whatsapp.net"
+      }
+    },
+    {
+      "id": "ddb40bf7aeef",
+      "name": "Resumo Noturno",
+      "prompt": "Resumo completo do dia para o Vinicius. Coleta TODOS os dados disponiveis:\n- Comercial DES: leads, ligacoes, vendas fechadas (http://localhost:9093/api/resumo-dia)\n- Bots: status de todos (http://localhost:9104/bots)\n- Engajamento mentoradas: alertas churn, mensagens (http://localhost:9090/api/groups/status)\n- Score do dia (de 0 a 10, baseado nos dados)\nFormato: resumo executivo. Comeca com \"Fechamento do dia:\" e termina com score + 3 prioridades pro amanha.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 20 * * 1-5",
+        "display": "0 20 * * 1-5"
+      },
+      "schedule_display": "0 20 * * 1-5",
+      "repeat": {
+        "times": null,
+        "completed": 15
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-04-13T09:26:14.015165-03:00",
+      "next_run_at": "2026-05-04T20:00:00-03:00",
+      "last_run_at": "2026-05-01T20:02:14.282503-03:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "whatsapp",
+      "origin": {
+        "platform": "whatsapp",
+        "chat_id": "5551991987972@s.whatsapp.net"
+      }
+    },
+    {
+      "id": "2074558bf162",
+      "name": "Compozy Watcher 15m",
+      "prompt": "O script do watcher roda antes do agente. Se a ultima linha for {\"wakeAgent\": false}, nao abra turno LLM nem entregue mensagem.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "compozy_watcher_tick.py",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 15,
+        "display": "every 15m"
+      },
+      "schedule_display": "every 15m",
+      "repeat": {
+        "times": null,
+        "completed": 1122
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-04-22T01:00:29.955864-03:00",
+      "next_run_at": "2026-05-03T20:08:10.698919-03:00",
+      "last_run_at": "2026-05-03T17:57:10.870781-03:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null
+    },
+    {
+      "id": "kanbanx0905",
+      "name": "Raio-X Kanban Multi-Agent",
+      "prompt": "Verifica o Kanban multi-agent do Hermes via http://127.0.0.1:8642/api/kanban/metrics e http://127.0.0.1:8642/api/kanban/cards?limit=20. Entrega para o Vinicius um raio-X curto: total, concluidas, falhas, agentes usados, skills paradas e uma sugestao concreta de delegacao para hoje. Se nao houver uso recente, sugerir 2 comandos praticos que o Vinicius pode mandar no WhatsApp, por exemplo raio-x de mentorada ou copy/roteiro da Daiane. Tom direto, sem floreio.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "5 9 * * 1-5",
+        "display": "5 9 * * 1-5"
+      },
+      "schedule_display": "5 9 * * 1-5",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-05-04T23:03:43.446187-03:00",
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "whatsapp",
+      "origin": {
+        "platform": "whatsapp",
+        "chat_id": "5551991987972@s.whatsapp.net"
+      }
+    }
+  ],
+  "updated_at": "2026-05-03T19:53:10.699389-03:00"
+}

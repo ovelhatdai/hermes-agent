@@ -1,0 +1,402 @@
+import json
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    body_limit_middleware,
+    cors_middleware,
+    security_headers_middleware,
+)
+from gateway.platforms._custom.asaas_router import AsaasAPIError, AsaasClient, mount_asaas_subapps
+
+
+class _Acquire:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeConnection:
+    def __init__(self, *, insert_id=101, webhook_insert_id=201):
+        self.insert_id = insert_id
+        self.webhook_insert_id = webhook_insert_id
+        self.webhook_insert_rows = []
+        self.fetchrow_calls = []
+        self.execute_calls = []
+
+    async def fetchrow(self, query, *args):
+        self.fetchrow_calls.append((query, args))
+        if "INSERT INTO public.asaas_event_log" in query:
+            if self.webhook_insert_rows:
+                return self.webhook_insert_rows.pop(0)
+            return {"id": self.webhook_insert_id}
+        return {"id": self.insert_id}
+
+    async def execute(self, query, *args):
+        self.execute_calls.append((query, args))
+        return "OK"
+
+
+class _FakePool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return _Acquire(self.conn)
+
+
+class _FakeAsaasClient:
+    def __init__(self, events):
+        self.events = events
+
+    async def ensure_customer(self, customer):
+        self.events.append(("ensure_customer", customer.cpfCnpj))
+        return {"id": "cus_123"}
+
+    async def create_payment(self, **kwargs):
+        self.events.append(("create_payment", kwargs["customer_id"], kwargs["installments"]))
+        return {
+            "id": "pay_123",
+            "invoiceUrl": "https://sandbox.asaas.com/i/pay_123",
+            "billingType": "CREDIT_CARD",
+        }
+
+
+@pytest.fixture(autouse=True)
+def _reset_env(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_TOKEN", "devtoken")
+    monkeypatch.setenv("ASAAS_WEBHOOK_TOKEN", "hooktoken")
+    monkeypatch.setenv("ASAAS_PRICE_TAG_DUPLA", "7500.00")
+    monkeypatch.setenv("ASAAS_DEFAULT_MAX_INSTALLMENTS", "12")
+    monkeypatch.setenv("ASAAS_DEFAULT_DUE_DAYS", "3")
+
+
+@pytest.fixture
+def payload():
+    return {
+        "sku": "TAG_DUPLA",
+        "customer": {
+            "name": "Maria Silva",
+            "cpfCnpj": "123.456.789-00",
+            "email": "maria@email.com",
+            "phone": "(51) 99999-8888",
+        },
+        "agent": "clara_sdr",
+        "conv_id": "45",
+        "lead_phone": "5511999998888",
+        "installments": 12,
+    }
+
+
+@pytest.fixture
+def webhook_payload():
+    return {
+        "id": "evt_test_003",
+        "event": "PAYMENT_CREATED",
+        "payment": {
+            "id": "pay_003",
+            "value": 100,
+            "customer": "cus_001",
+        },
+    }
+
+
+def _build_test_app(adapter: APIServerAdapter) -> web.Application:
+    middlewares = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=middlewares)
+    app["api_server_adapter"] = adapter
+    mount_asaas_subapps(app, adapter)
+    return app
+
+
+@pytest_asyncio.fixture
+async def test_app(monkeypatch):
+    conn = _FakeConnection()
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter.gateway_runner = SimpleNamespace(adapters={})
+    adapter._media_dispatch_pool = _FakePool(conn)
+
+    events = []
+    fake_client = _FakeAsaasClient(events)
+    monkeypatch.setattr(
+        "gateway.platforms._custom.asaas_router.AsaasClient.from_env",
+        lambda: fake_client,
+    )
+
+    async with TestClient(TestServer(_build_test_app(adapter))) as client:
+        yield client, conn, events
+
+
+@pytest.mark.asyncio
+async def test_missing_bearer_returns_401(test_app, payload):
+    client, _conn, _events = test_app
+    response = await client.post("/api/gateway/asaas/create-payment", json=payload)
+
+    assert response.status == 401
+    assert await response.json() == {"ok": False, "error": "missing_bearer"}
+
+
+@pytest.mark.asyncio
+async def test_invalid_bearer_returns_401(test_app, payload):
+    client, _conn, _events = test_app
+    response = await client.post(
+        "/api/gateway/asaas/create-payment",
+        json=payload,
+        headers={"Authorization": "Bearer wrong"},
+    )
+
+    assert response.status == 401
+    assert await response.json() == {"ok": False, "error": "invalid_bearer"}
+
+
+@pytest.mark.asyncio
+async def test_invalid_payload_returns_400(test_app):
+    client, _conn, _events = test_app
+    response = await client.post(
+        "/api/gateway/asaas/create-payment",
+        json={"sku": "TAG_DUPLA"},
+        headers={"Authorization": "Bearer devtoken"},
+    )
+
+    assert response.status == 400
+    body = await response.json()
+    assert body["ok"] is False
+    assert body["error"] == "invalid_request"
+    assert body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_sku_returns_400(test_app, payload):
+    client, _conn, _events = test_app
+    payload["sku"] = "SKU_INEXISTENTE"
+
+    response = await client.post(
+        "/api/gateway/asaas/create-payment",
+        json=payload,
+        headers={"Authorization": "Bearer devtoken"},
+    )
+
+    assert response.status == 400
+    assert await response.json() == {"ok": False, "error": "invalid_sku"}
+
+
+@pytest.mark.asyncio
+async def test_missing_price_returns_500(test_app, payload, monkeypatch):
+    client, conn, events = test_app
+    monkeypatch.delenv("ASAAS_PRICE_TAG_DUPLA", raising=False)
+
+    response = await client.post(
+        "/api/gateway/asaas/create-payment",
+        json=payload,
+        headers={"Authorization": "Bearer devtoken"},
+    )
+
+    assert response.status == 500
+    assert await response.json() == {"ok": False, "error": "price_not_configured"}
+    assert conn.fetchrow_calls == []
+    assert conn.execute_calls == []
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_happy_path_returns_invoice_and_persists_before_asaas(test_app, payload):
+    client, conn, events = test_app
+
+    response = await client.post(
+        "/api/gateway/asaas/create-payment",
+        json=payload,
+        headers={"Authorization": "Bearer devtoken"},
+    )
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["invoice_url"] == "https://sandbox.asaas.com/i/pay_123"
+    assert body["payment_id"] == "pay_123"
+    assert body["asaas_customer_id"] == "cus_123"
+    assert body["billing_type"] == "CREDIT_CARD"
+    assert body["due_date"]
+
+    assert len(conn.fetchrow_calls) == 1
+    insert_query, insert_args = conn.fetchrow_calls[0]
+    assert "INSERT INTO public.asaas_payment_request" in insert_query
+    assert insert_args[0] == "clara_sdr"
+    assert insert_args[2] == "5511999998888"
+    assert insert_args[6] == "TAG_DUPLA"
+
+    assert events[0] == ("ensure_customer", "12345678900")
+    assert events[1] == ("create_payment", "cus_123", 12)
+    assert conn.execute_calls[0][0].strip().startswith("UPDATE public.asaas_payment_request")
+
+
+@pytest.mark.asyncio
+async def test_webhook_missing_token_returns_401(test_app, webhook_payload):
+    client, _conn, _events = test_app
+    response = await client.post("/asaas/webhook", json=webhook_payload)
+
+    assert response.status == 401
+    assert await response.json() == {"ok": False, "error": "missing_asaas_access_token"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_invalid_token_returns_401(test_app, webhook_payload):
+    client, _conn, _events = test_app
+    response = await client.post(
+        "/asaas/webhook",
+        json=webhook_payload,
+        headers={"asaas-access-token": "wrong"},
+    )
+
+    assert response.status == 401
+    assert await response.json() == {"ok": False, "error": "invalid_asaas_access_token"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_missing_id_or_event_returns_400(test_app):
+    client, _conn, _events = test_app
+    response = await client.post(
+        "/asaas/webhook",
+        json={"id": "evt_test_003"},
+        headers={"asaas-access-token": "hooktoken"},
+    )
+
+    assert response.status == 400
+    body = await response.json()
+    assert body["ok"] is False
+    assert body["error"] == "invalid_request"
+    assert body["detail"] == "missing_event"
+
+
+@pytest.mark.asyncio
+async def test_webhook_valid_event_returns_200_duplicate_false(test_app, webhook_payload):
+    client, conn, _events = test_app
+    response = await client.post(
+        "/asaas/webhook",
+        json=webhook_payload,
+        headers={"asaas-access-token": "hooktoken"},
+    )
+
+    assert response.status == 200
+    assert await response.json() == {"ok": True, "duplicate": False}
+
+    query, args = conn.fetchrow_calls[-1]
+    assert "INSERT INTO public.asaas_event_log" in query
+    assert args[0] == "evt_test_003"
+    assert args[1] == "PAYMENT_CREATED"
+    assert args[2] == "pay_003"
+    assert args[3] == "cus_001"
+    assert str(args[4]) == "100.00"
+    assert json.loads(args[5])["payment"]["id"] == "pay_003"
+
+
+@pytest.mark.asyncio
+async def test_webhook_duplicate_event_returns_200_duplicate_true(test_app, webhook_payload):
+    client, conn, _events = test_app
+    conn.webhook_insert_rows = [{"id": 301}, None]
+
+    first = await client.post(
+        "/asaas/webhook",
+        json=webhook_payload,
+        headers={"asaas-access-token": "hooktoken"},
+    )
+    second = await client.post(
+        "/asaas/webhook",
+        json=webhook_payload,
+        headers={"asaas-access-token": "hooktoken"},
+    )
+
+    assert first.status == 200
+    assert await first.json() == {"ok": True, "duplicate": False}
+    assert second.status == 200
+    assert await second.json() == {"ok": True, "duplicate": True}
+
+
+
+@pytest.mark.asyncio
+async def test_asaas_client_create_payment_forces_credit_card(monkeypatch):
+    captured = {}
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"id": "pay_123", "billingType": "CREDIT_CARD"}
+
+    class _AsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, path, params=None, json=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["json"] = json
+            return _Response()
+
+    monkeypatch.setattr("gateway.platforms._custom.asaas_router.httpx.AsyncClient", _AsyncClient)
+
+    client = AsaasClient(base_url="https://sandbox.asaas.com/api/v3", api_key="test")
+    await client.create_payment(
+        customer_id="cus_123",
+        sku="TAG_SOLO",
+        amount=Decimal("5000.00"),
+        due_date="2026-05-05",
+        installments=12,
+        external_reference="test",
+    )
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/payments"
+    assert captured["json"]["billingType"] == "CREDIT_CARD"
+
+
+@pytest.mark.asyncio
+async def test_asaas_client_rejects_non_credit_card_payload(monkeypatch):
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"id": "pay_123", "billingType": "BOLETO"}
+
+    class _AsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, path, params=None, json=None):
+            return _Response()
+
+    monkeypatch.setattr("gateway.platforms._custom.asaas_router.httpx.AsyncClient", _AsyncClient)
+
+    client = AsaasClient(base_url="https://sandbox.asaas.com/api/v3", api_key="test")
+    with pytest.raises(AsaasAPIError):
+        await client.create_payment(
+            customer_id="cus_123",
+            sku="TAG_SOLO",
+            amount=Decimal("5000.00"),
+            due_date="2026-05-05",
+            installments=12,
+            external_reference="test",
+        )

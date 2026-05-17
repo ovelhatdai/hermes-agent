@@ -1,0 +1,1 @@
+{"pid": 3798639, "kind": "hermes-gateway", "argv": ["/root/.hermes/hermes-agent-v12/venv/bin/hermes", "gateway", "run", "-v"], "start_time": 271960344}

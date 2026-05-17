@@ -1,0 +1,637 @@
+"""SPEC-093 - Asaas event processing for the Hermes gateway."""
+
+from __future__ import annotations
+
+import asyncio
+from decimal import Decimal, InvalidOperation
+import logging
+import os
+from typing import Any
+
+import httpx
+
+from gateway.platforms._custom.compat import ensure_media_dispatch_pool, get_whatsapp_platform
+
+logger = logging.getLogger(__name__)
+
+_EVENT_SUMMARY_MAP = {
+    "PAYMENT_RECEIVED": "pagou",
+    "PAYMENT_OVERDUE": "esta com pagamento vencido",
+    "PAYMENT_CHARGEBACK_REQUESTED": "solicitou chargeback",
+    "PAYMENT_CREDIT_CARD_CAPTURE_REFUSED": "teve captura de cartao recusada",
+    "PAYMENT_BANK_SLIP_VIEWED": "visualizou o boleto",
+    "PAYMENT_REFUNDED": "teve pagamento estornado",
+}
+
+_ZAPSIGN_TEMPLATE_ENV = {
+    "TAG_SOLO": "ZAPSIGN_TEMPLATE_TAG_SOLO",
+    "TAG_DUPLA": "ZAPSIGN_TEMPLATE_TAG_DUPLA",
+    "REVOLUCAO_BASICO": "ZAPSIGN_TEMPLATE_REVOLUCAO_BASICO",
+    "REVOLUCAO_AVANCADO": "ZAPSIGN_TEMPLATE_REVOLUCAO_AVANCADO",
+}
+
+
+async def _get_pool(adapter: Any) -> Any:
+    return await ensure_media_dispatch_pool(adapter)
+
+
+def _row_to_dict(row: Any) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        keys = getattr(row, "keys", None)
+        if callable(keys):
+            return {key: row[key] for key in keys()}
+        raise TypeError(f"unsupported_row_type:{type(row)!r}")
+
+
+def _truncate_error(message: str | None) -> str | None:
+    if message is None:
+        return None
+    text = str(message).strip()
+    return text[:500] if text else None
+
+
+def _coerce_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _format_brl(value: Any) -> str:
+    amount = _coerce_decimal(value)
+    if amount is None:
+        return "n/a"
+    formatted = f"{amount:,.2f}"
+    return f"R$ {formatted.replace(',', 'X').replace('.', ',').replace('X', '.')}"
+
+
+def _normalize_phone(phone: str | None) -> str | None:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if not digits:
+        return None
+    if not digits.startswith("55"):
+        digits = f"55{digits}"
+    return digits
+
+
+def _payment_payload(event_row: dict[str, Any]) -> dict[str, Any]:
+    payload = event_row.get("payload")
+    if isinstance(payload, dict):
+        payment = payload.get("payment")
+        if isinstance(payment, dict):
+            return payment
+    return {}
+
+
+def _payment_id_from(event_row: dict[str, Any]) -> str | None:
+    payment_id = event_row.get("payment_id")
+    if isinstance(payment_id, str) and payment_id.strip():
+        return payment_id.strip()
+    payment = _payment_payload(event_row)
+    value = payment.get("id")
+    return str(value).strip() if value else None
+
+
+async def _try_lock_event(conn: Any, event_id: int) -> bool:
+    return bool(await conn.fetchval("SELECT pg_try_advisory_lock($1)", event_id))
+
+
+async def _unlock_event(conn: Any, event_id: int) -> None:
+    try:
+        await conn.execute("SELECT pg_advisory_unlock($1)", event_id)
+    except Exception:
+        logger.debug("[asaas_events] advisory unlock failed event_id=%s", event_id, exc_info=True)
+
+
+async def _fetch_event_row(conn: Any, event_id: int) -> dict[str, Any] | None:
+    row = await conn.fetchrow(
+        """
+        SELECT
+            id,
+            asaas_event_id,
+            event_type,
+            payment_id,
+            customer_id,
+            amount,
+            payload,
+            processed_at,
+            zapsign_doc_id,
+            notification_sent,
+            error_message,
+            created_at
+        FROM public.asaas_event_log
+        WHERE id = $1
+        """,
+        event_id,
+    )
+    return _row_to_dict(row)
+
+
+async def _fetch_pending_event_rows(conn: Any, limit: int) -> list[dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT
+            id,
+            asaas_event_id,
+            event_type,
+            payment_id,
+            customer_id,
+            amount,
+            payload,
+            processed_at,
+            zapsign_doc_id,
+            notification_sent,
+            error_message,
+            created_at
+        FROM public.asaas_event_log
+        WHERE processed_at IS NULL
+        ORDER BY created_at ASC, id ASC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return [_row_to_dict(row) for row in rows if row is not None]
+
+
+async def _fetch_payment_request(conn: Any, payment_id: str | None) -> dict[str, Any] | None:
+    if not payment_id:
+        return None
+    row = await conn.fetchrow(
+        """
+        SELECT
+            id,
+            agent_source,
+            conv_id,
+            lead_phone,
+            lead_name,
+            lead_cpf,
+            lead_email,
+            sku,
+            amount,
+            installments,
+            asaas_customer_id,
+            asaas_payment_id,
+            invoice_url,
+            status,
+            error_message,
+            created_at,
+            updated_at
+        FROM public.asaas_payment_request
+        WHERE asaas_payment_id = $1
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        payment_id,
+    )
+    return _row_to_dict(row)
+
+
+async def _update_payment_request_status(
+    conn: Any,
+    payment_id: str | None,
+    *,
+    status: str,
+    error_message: str | None = None,
+) -> dict[str, Any] | None:
+    if not payment_id:
+        return None
+    await conn.execute(
+        """
+        UPDATE public.asaas_payment_request
+        SET
+            status = $1,
+            error_message = $2,
+            updated_at = NOW()
+        WHERE asaas_payment_id = $3
+        """,
+        status,
+        _truncate_error(error_message),
+        payment_id,
+    )
+    return await _fetch_payment_request(conn, payment_id)
+
+
+async def _mark_event_processed(
+    conn: Any,
+    event_id: int,
+    *,
+    notification_sent: bool,
+    zapsign_doc_id: str | None,
+    error_message: str | None,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE public.asaas_event_log
+        SET
+            processed_at = NOW(),
+            notification_sent = $1,
+            zapsign_doc_id = $2,
+            error_message = $3
+        WHERE id = $4
+        """,
+        notification_sent,
+        zapsign_doc_id,
+        _truncate_error(error_message),
+        event_id,
+    )
+
+
+async def _record_event_error(conn: Any, event_id: int, error_message: str) -> None:
+    await conn.execute(
+        """
+        UPDATE public.asaas_event_log
+        SET error_message = $1
+        WHERE id = $2
+        """,
+        _truncate_error(error_message),
+        event_id,
+    )
+
+
+def _resolve_notification_targets() -> list[str]:
+    targets: list[str] = []
+    for env_name in ("HERMES_NOTIFY_PHONE_VINI", "HERMES_NOTIFY_PHONE_JOANNE"):
+        normalized = _normalize_phone(os.getenv(env_name))
+        if normalized and normalized not in targets:
+            targets.append(normalized)
+    return targets
+
+
+def _notification_text(
+    event_type: str,
+    payment_request: dict[str, Any] | None,
+    event_row: dict[str, Any],
+    *,
+    zapsign_status: str,
+    extra_error: str | None = None,
+) -> str:
+    payment = _payment_payload(event_row)
+    lead_name = (
+        (payment_request or {}).get("lead_name")
+        or payment.get("customerName")
+        or payment.get("name")
+        or "Lead sem nome"
+    )
+    sku = (payment_request or {}).get("sku") or "SKU_DESCONHECIDA"
+    amount = (payment_request or {}).get("amount") or event_row.get("amount") or payment.get("value")
+    payment_id = _payment_id_from(event_row) or "n/a"
+    invoice_url = (
+        (payment_request or {}).get("invoice_url")
+        or payment.get("invoiceUrl")
+        or payment.get("bankSlipUrl")
+        or "n/a"
+    )
+    action = _EVENT_SUMMARY_MAP.get(event_type, f"teve evento {event_type}")
+    lines = [
+        f"Lead {lead_name} {action} {sku}",
+        f"Valor: {_format_brl(amount)}",
+        f"payment_id: {payment_id}",
+        f"invoice_url: {invoice_url}",
+        f"status evento: {event_type}",
+        f"resultado ZapSign: {zapsign_status}",
+    ]
+    if extra_error:
+        lines.append(f"detalhe: {extra_error}")
+    return "\n".join(lines)
+
+
+async def _send_operational_notification(
+    adapter: Any,
+    event_type: str,
+    payment_request: dict[str, Any] | None,
+    event_row: dict[str, Any],
+    *,
+    zapsign_status: str,
+    extra_error: str | None = None,
+) -> bool:
+    whatsapp = get_whatsapp_platform(adapter)
+    if whatsapp is None:
+        logger.warning("[asaas_events] whatsapp platform unavailable for %s", event_type)
+        return False
+
+    message = _notification_text(
+        event_type,
+        payment_request,
+        event_row,
+        zapsign_status=zapsign_status,
+        extra_error=extra_error,
+    )
+
+    delivered = False
+    for target in _resolve_notification_targets():
+        chat_id = f"{target}@s.whatsapp.net"
+        result = await whatsapp.send(chat_id, message)
+        if getattr(result, "success", False):
+            delivered = True
+            continue
+        logger.warning(
+            "[asaas_events] notification send failed event_type=%s target=%s error=%s",
+            event_type,
+            target,
+            getattr(result, "error", "unknown"),
+        )
+    return delivered
+
+
+async def _emit_hermes_sensor_event(
+    adapter: Any,
+    event_type: str,
+    payment_request: dict[str, Any] | None,
+    event_row: dict[str, Any],
+    *,
+    zapsign_status: str,
+) -> None:
+    try:
+        from gateway.platforms._custom.eventos_router import emit_sensor_event
+
+        payment = _payment_payload(event_row)
+        event_payload = {
+            "payment_id": _payment_id_from(event_row),
+            "lead_name": (payment_request or {}).get("lead_name") or payment.get("customerName"),
+            "lead_phone": (payment_request or {}).get("lead_phone"),
+            "sku": (payment_request or {}).get("sku"),
+            "amount": (payment_request or {}).get("amount") or event_row.get("amount") or payment.get("value"),
+            "invoice_url": (payment_request or {}).get("invoice_url") or payment.get("invoiceUrl") or payment.get("bankSlipUrl"),
+            "zapsign_status": zapsign_status,
+            "asaas_event_id": event_row.get("asaas_event_id"),
+        }
+        await emit_sensor_event(adapter, "asaas", event_type, event_payload)
+        if zapsign_status == "success":
+            await emit_sensor_event(adapter, "asaas", "CONTRACT_SIGNED", event_payload)
+    except Exception as exc:
+        logger.warning("[asaas_events] Hermes sensor emit failed event_type=%s error=%s", event_type, exc)
+
+
+def _zapsign_endpoint() -> str:
+    return (os.getenv("ZAPSIGN_CREATE_DOC_URL") or os.getenv("ZAPSIGN_DOC_CREATE_URL") or "").strip()
+
+
+def _zapsign_timeout_seconds() -> float:
+    raw = (os.getenv("ZAPSIGN_TIMEOUT_SECONDS") or "20").strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 20.0
+
+
+async def create_zapsign_doc_for_payment(
+    payment_request: dict[str, Any] | None,
+    event_row: dict[str, Any],
+) -> dict[str, Any]:
+    request = payment_request or {}
+    sku = str(request.get("sku") or "").strip().upper()
+    template_env = _ZAPSIGN_TEMPLATE_ENV.get(sku)
+    template_id = (os.getenv(template_env) if template_env else "") or ""
+    endpoint = _zapsign_endpoint()
+    if not template_env or not template_id.strip() or not endpoint:
+        return {
+            "status": "config_missing",
+            "doc_id": None,
+            "error_message": "zapsign_not_configured",
+        }
+
+    payment = _payment_payload(event_row)
+    signer = {
+        "name": request.get("lead_name"),
+        "email": request.get("lead_email"),
+        "phone": _normalize_phone(request.get("lead_phone")),
+        "cpf": request.get("lead_cpf"),
+    }
+    body = {
+        "template_id": template_id.strip(),
+        "external_id": _payment_id_from(event_row),
+        "signers": [signer],
+        "payment": {
+            "sku": request.get("sku"),
+            "amount": str(request.get("amount") or event_row.get("amount") or payment.get("value") or ""),
+            "payment_id": _payment_id_from(event_row),
+            "invoice_url": request.get("invoice_url") or payment.get("invoiceUrl") or payment.get("bankSlipUrl"),
+        },
+        "metadata": {
+            "agent_source": request.get("agent_source"),
+            "conv_id": request.get("conv_id"),
+            "lead_phone": request.get("lead_phone"),
+            "asaas_event_id": event_row.get("asaas_event_id"),
+        },
+    }
+
+    headers = {"Content-Type": "application/json"}
+    token = (os.getenv("ZAPSIGN_API_TOKEN") or os.getenv("ZAPSIGN_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_zapsign_timeout_seconds())) as client:
+            response = await client.post(endpoint, json=body, headers=headers)
+        payload = response.json() if response.content else {}
+    except Exception as exc:
+        logger.warning("[asaas_events] zapsign request failed: %s", exc)
+        return {
+            "status": "failed",
+            "doc_id": None,
+            "error_message": f"zapsign_request_failed:{exc.__class__.__name__}",
+        }
+
+    if response.status_code >= 400:
+        detail = "zapsign_request_failed"
+        if isinstance(payload, dict):
+            detail = str(payload.get("error") or payload.get("message") or detail)
+        return {
+            "status": "failed",
+            "doc_id": None,
+            "error_message": f"zapsign_request_failed:{detail}",
+        }
+
+    if not isinstance(payload, dict):
+        payload = {}
+    doc_id = str(payload.get("id") or payload.get("doc_id") or payload.get("document_id") or "").strip()
+    if not doc_id:
+        return {
+            "status": "failed",
+            "doc_id": None,
+            "error_message": "zapsign_missing_doc_id",
+        }
+
+    return {
+        "status": "success",
+        "doc_id": doc_id,
+        "error_message": None,
+    }
+
+
+async def _handle_status_only_event(
+    adapter: Any,
+    conn: Any,
+    event_row: dict[str, Any],
+    *,
+    status: str,
+) -> dict[str, Any]:
+    payment_request = await _update_payment_request_status(conn, _payment_id_from(event_row), status=status)
+    notification_sent = await _send_operational_notification(
+        adapter,
+        str(event_row.get("event_type") or ""),
+        payment_request,
+        event_row,
+        zapsign_status="skipped",
+    )
+    await _emit_hermes_sensor_event(
+        adapter,
+        str(event_row.get("event_type") or ""),
+        payment_request,
+        event_row,
+        zapsign_status="skipped",
+    )
+    return {
+        "notification_sent": notification_sent,
+        "zapsign_doc_id": None,
+        "error_message": None,
+    }
+
+
+async def handle_payment_received(adapter: Any, conn: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    payment_id = _payment_id_from(event_row)
+    payment_request = await _update_payment_request_status(conn, payment_id, status="paid")
+    zapsign_result = await create_zapsign_doc_for_payment(payment_request, event_row)
+    notification_sent = await _send_operational_notification(
+        adapter,
+        "PAYMENT_RECEIVED",
+        payment_request,
+        event_row,
+        zapsign_status=str(zapsign_result.get("status") or "failed"),
+        extra_error=zapsign_result.get("error_message"),
+    )
+    await _emit_hermes_sensor_event(
+        adapter,
+        "PAYMENT_RECEIVED",
+        payment_request,
+        event_row,
+        zapsign_status=str(zapsign_result.get("status") or "failed"),
+    )
+    return {
+        "notification_sent": notification_sent,
+        "zapsign_doc_id": zapsign_result.get("doc_id"),
+        "error_message": zapsign_result.get("error_message"),
+    }
+
+
+async def handle_payment_overdue(adapter: Any, conn: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    return await _handle_status_only_event(adapter, conn, event_row, status="overdue")
+
+
+async def handle_payment_chargeback_requested(adapter: Any, conn: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    return await _handle_status_only_event(adapter, conn, event_row, status="chargeback")
+
+
+async def handle_payment_credit_card_capture_refused(adapter: Any, conn: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    return await _handle_status_only_event(adapter, conn, event_row, status="capture_refused")
+
+
+async def handle_payment_bank_slip_viewed(adapter: Any, conn: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    return await _handle_status_only_event(adapter, conn, event_row, status="bank_slip_viewed")
+
+
+async def handle_payment_refunded(adapter: Any, conn: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    return await _handle_status_only_event(adapter, conn, event_row, status="refunded")
+
+
+_EVENT_HANDLERS = {
+    "PAYMENT_RECEIVED": handle_payment_received,
+    "PAYMENT_OVERDUE": handle_payment_overdue,
+    "PAYMENT_CHARGEBACK_REQUESTED": handle_payment_chargeback_requested,
+    "PAYMENT_CREDIT_CARD_CAPTURE_REFUSED": handle_payment_credit_card_capture_refused,
+    "PAYMENT_BANK_SLIP_VIEWED": handle_payment_bank_slip_viewed,
+    "PAYMENT_REFUNDED": handle_payment_refunded,
+}
+
+
+async def process_event(adapter: Any, event_row: dict[str, Any]) -> dict[str, Any]:
+    event_id = int(event_row["id"])
+    pool = await _get_pool(adapter)
+    async with pool.acquire() as conn:
+        locked = await _try_lock_event(conn, event_id)
+        if not locked:
+            return {"ok": False, "status": "locked", "event_id": event_id}
+
+        try:
+            current_row = await _fetch_event_row(conn, event_id)
+            if current_row is None:
+                return {"ok": False, "status": "missing", "event_id": event_id}
+            if current_row.get("processed_at") is not None:
+                return {"ok": True, "status": "already_processed", "event_id": event_id}
+
+            event_type = str(current_row.get("event_type") or "").strip().upper()
+            handler = _EVENT_HANDLERS.get(event_type)
+            if handler is None:
+                result = {
+                    "notification_sent": False,
+                    "zapsign_doc_id": None,
+                    "error_message": f"unsupported_event:{event_type or 'unknown'}",
+                }
+            else:
+                result = await handler(adapter, conn, current_row)
+
+            await _mark_event_processed(
+                conn,
+                event_id,
+                notification_sent=bool(result.get("notification_sent")),
+                zapsign_doc_id=result.get("zapsign_doc_id"),
+                error_message=result.get("error_message"),
+            )
+            return {"ok": True, "status": "processed", "event_id": event_id, **result}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_message = _truncate_error(str(exc) or exc.__class__.__name__) or exc.__class__.__name__
+            await _record_event_error(conn, event_id, error_message)
+            logger.exception("[asaas_events] process_event failed event_id=%s error=%s", event_id, exc)
+            return {"ok": False, "status": "failed", "event_id": event_id, "error": error_message}
+        finally:
+            await _unlock_event(conn, event_id)
+
+
+async def process_pending_events(adapter: Any, limit: int = 10) -> dict[str, int]:
+    batch_size = max(1, int(limit))
+    pool = await _get_pool(adapter)
+    async with pool.acquire() as conn:
+        pending_rows = await _fetch_pending_event_rows(conn, batch_size)
+
+    processed = 0
+    skipped = 0
+    failed = 0
+    for row in pending_rows:
+        result = await process_event(adapter, row)
+        status = result.get("status")
+        if result.get("ok") and status == "processed":
+            processed += 1
+        elif status in {"already_processed", "locked", "missing"}:
+            skipped += 1
+        else:
+            failed += 1
+
+    return {
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "scanned": len(pending_rows),
+    }
+
+
+__all__ = [
+    "create_zapsign_doc_for_payment",
+    "handle_payment_bank_slip_viewed",
+    "handle_payment_chargeback_requested",
+    "handle_payment_credit_card_capture_refused",
+    "handle_payment_overdue",
+    "handle_payment_received",
+    "handle_payment_refunded",
+    "process_event",
+    "process_pending_events",
+]

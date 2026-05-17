@@ -1,0 +1,625 @@
+"""SPEC-117 — Hermes ouve Fofoqueiro (trafego_pago Caso 5).
+
+Webhook handler que recebe POST /api/webhook/trafego-card-event do classifier
+SPEC-110 (porta 9173). Faz:
+1. Valida Bearer token HERMES_TRAFEGO_TOKEN
+2. Dedup check (mesma mentorada+categoria <4h = drop)
+3. INSERT hermes_event_log status=triggered
+4. Background: dispara Goal (max 6 turns) que cruza Meta Ads + lead facts +
+   transcricoes + clientes DES → output diagnostico+acao
+5. Goal envia mensagem rica pra DRI (Diulia/Joao via WhatsApp /send bridge)
+6. Atualiza status=notified
+
+Escalation T+1h e T+2h sao tratados por timer separado (hermes-trafego-escalation).
+
+Mentorada nao identificada (group_jid sem match) → fallback Vinicius com aviso.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import asyncpg
+import yaml
+from aiohttp import web
+
+logger = logging.getLogger(__name__)
+
+# ---- config ----
+DB_URL = os.environ.get(
+    "HERMES_DB_URL", "postgresql://postgres@127.0.0.1:5432/hermes"
+)
+EXPECTED_TOKEN = os.environ.get("HERMES_TRAFEGO_TOKEN", "").strip()
+DRI_CONFIG_PATH = os.environ.get(
+    "HERMES_TRAFEGO_DRI_CONFIG", "/etc/hermes/trafego-dri.yml"
+)
+DEDUP_SECONDS = int(os.environ.get("HERMES_TRAFEGO_DEDUP_SECONDS", "14400"))
+GOAL_MAX_TURNS = int(os.environ.get("HERMES_TRAFEGO_GOAL_MAX_TURNS", "6"))
+BRIDGE_SEND_URL = os.environ.get(
+    "HERMES_BRIDGE_SEND_URL", "http://127.0.0.1:3000/send"
+)
+TRAFEGO_API_URL = os.environ.get(
+    "HERMES_TRAFEGO_API_URL", "http://127.0.0.1:9173"
+).rstrip("/")
+ACK_TOKEN = (
+    os.environ.get("HERMES_INBOUND_TOKEN")
+    or os.environ.get("FOFO_INBOUND_TOKEN")
+    or os.environ.get("HERMES_TRAFEGO_TOKEN")
+    or ""
+).strip()
+VINI_PHONE = "5551991987972"
+ACK_PATTERNS = [
+    re.compile(r"\b(?:vi|assumi|peguei|tratado|ok|ack)\s*#\s*(\d+)\b", re.I),
+    re.compile(r"\bj[aá]\s+vi\s*#\s*(\d+)\b", re.I),
+]
+
+_pool: asyncpg.Pool | None = None
+_dri_config: dict[str, Any] | None = None
+
+
+async def _get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            DB_URL, min_size=1, max_size=4, command_timeout=10
+        )
+    return _pool
+
+
+def _load_dri_config() -> dict[str, Any]:
+    global _dri_config
+    try:
+        with open(DRI_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _dri_config = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        logger.warning(
+            "[trafego] DRI config %s nao encontrado — usando fallback Vini",
+            DRI_CONFIG_PATH,
+        )
+        _dri_config = {
+            "categories": {
+                "trafego_pago": {
+                    "primary": {"name": "Vinicius", "phone": VINI_PHONE},
+                }
+            }
+        }
+    return _dri_config
+
+
+def _resolve_dri(category: str) -> dict[str, str]:
+    cfg = _load_dri_config()
+    cat = (cfg.get("categories") or {}).get(category) or {}
+    primary = cat.get("primary") or {"name": "Vinicius", "phone": VINI_PHONE}
+    return primary
+
+
+def _dri_phones() -> set[str]:
+    cfg = _load_dri_config()
+    phones: set[str] = set()
+    for cat in (cfg.get("categories") or {}).values():
+        for key in ("primary", "backup", "escalation"):
+            phone = ((cat or {}).get(key) or {}).get("phone")
+            if phone:
+                phones.add(str(phone).replace("+", "").replace(" ", ""))
+    phones.add(VINI_PHONE)
+    return phones
+
+
+def parse_ack_card_id(text: str) -> int | None:
+    for pattern in ACK_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            return int(match.group(1))
+    return None
+
+
+# ---- handler principal ----
+async def handle_trafego_card_event(request: web.Request) -> web.Response:
+    # 1. auth
+    auth = request.headers.get("Authorization", "")
+    if not EXPECTED_TOKEN:
+        logger.error(
+            "[trafego] HERMES_TRAFEGO_TOKEN nao configurado — recusando todas as requests"
+        )
+        return web.json_response(
+            {"error": "server_token_unconfigured"}, status=503
+        )
+    if not auth.startswith("Bearer ") or auth[7:] != EXPECTED_TOKEN:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    # 2. parse
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    required = ("category", "msg_text")
+    missing = [k for k in required if not body.get(k)]
+    if missing:
+        return web.json_response(
+            {"error": "missing_fields", "fields": missing}, status=400
+        )
+
+    pool = await _get_pool()
+    payload_json = json.dumps(body, ensure_ascii=False)
+
+    # 3. dedup
+    mentorada_id = body.get("mentorada_id")
+    category = body["category"]
+    async with pool.acquire() as con:
+        existing = None
+        if mentorada_id:
+            existing = await con.fetchrow(
+                """
+                SELECT id FROM hermes_event_log
+                WHERE mentorada_id = $1 AND category = $2
+                  AND created_at > NOW() - make_interval(secs => $3)
+                  AND status NOT IN ('dropped_dedup')
+                ORDER BY id DESC LIMIT 1
+                """,
+                mentorada_id,
+                category,
+                int(DEDUP_SECONDS),
+            )
+
+        if existing:
+            await con.execute(
+                """
+                INSERT INTO hermes_event_log (
+                    event_type, card_id, mentorada_id, mentorada_name, category,
+                    group_jid, group_name, sender_jid, msg_text, msg_timestamp,
+                    status, webhook_payload
+                ) VALUES (
+                    'trafego_card', $1, $2, $3, $4,
+                    $5, $6, $7, $8, $9,
+                    'dropped_dedup', $10::jsonb
+                )
+                """,
+                body.get("card_id"),
+                mentorada_id,
+                body.get("mentorada_name"),
+                category,
+                body.get("group_jid"),
+                body.get("group_name"),
+                body.get("sender_jid"),
+                body.get("msg_text"),
+                body.get("msg_timestamp"),
+                payload_json,
+            )
+            logger.info(
+                "[trafego] dedup drop mentorada_id=%s category=%s prev_id=%s",
+                mentorada_id,
+                category,
+                existing["id"],
+            )
+            return web.json_response(
+                {"status": "dropped_dedup", "previous_event_id": existing["id"]}
+            )
+
+        # 4. INSERT log
+        row = await con.fetchrow(
+            """
+            INSERT INTO hermes_event_log (
+                event_type, card_id, mentorada_id, mentorada_name, category,
+                group_jid, group_name, sender_jid, msg_text, msg_timestamp,
+                status, webhook_payload
+            ) VALUES (
+                'trafego_card', $1, $2, $3, $4,
+                $5, $6, $7, $8, $9,
+                'triggered', $10::jsonb
+            )
+            RETURNING id
+            """,
+            body.get("card_id"),
+            mentorada_id,
+            body.get("mentorada_name"),
+            category,
+            body.get("group_jid"),
+            body.get("group_name"),
+            body.get("sender_jid"),
+            body.get("msg_text"),
+            body.get("msg_timestamp"),
+            payload_json,
+        )
+        event_id = row["id"]
+
+    # 5. dispara Goal background (nao bloqueia)
+    asyncio.create_task(_run_trafego_goal(event_id, body))
+
+    return web.json_response(
+        {"status": "received", "event_id": event_id}
+    )
+
+
+CATEGORY_PROMPTS = {
+    "trafego_pago": """A mentorada {mentorada_name} acabou de reclamar no grupo "{group_name}":
+
+"{msg_text}"
+
+DADOS REAIS JA BUSCADOS:
+{context_block}
+
+Sua missao: alertar a {dri_name_for_prompt} (gestora de trafego) de forma clara e leve, como se fosse um colega de equipe avisando ela sobre um caso que precisa ela olhar.
+
+Manda a mensagem pra {dri_name_for_prompt} (1a pessoa, tom proximo) com:
+
+- Quem reclamou e o que ela disse, em linguagem natural (nao tecniques)
+- 1-2 hipoteses do que pode estar rolando, usando os dados reais acima quando existirem
+- 1 sugestao concreta do que ela poderia checar primeiro
+
+ESTILO:
+- Conversa de equipe, nao relatorio. Como se voce fosse um colega que viu o problema e ta dando o toque.
+- Frases curtas. Sem listas numeradas. Sem markdown pesado.
+- Pode usar "ela", "a Karoline", "essa mentorada" — natural.
+- Sem jargao gringo (CPL pode aparecer se ela mencionou; senao traduz pra "custo do lead").
+- Maximo 6 linhas.
+- Comeca com nome dela (vocativo) tipo "Diulia, " ou "Joao, ".
+- Nao usa emoji.
+- Nao inventa numeros. So cita numeros que aparecem em DADOS REAIS JA BUSCADOS.
+- Se CAC aparecer como pendente, diga que ainda falta cruzar com fechamento/contrato, sem inventar.
+
+EXEMPLO DE TOM (nao copia, soh inspiracao):
+"Diulia, a Karoline acabou de mandar no grupo que o anuncio dela ta R$45 de custo por lead, antes era R$8. Ja trocou criativo 2x e nao deu certo. Pode ser saturacao da audiencia ou algum bloqueio na conta — vale tu olhar a frequencia dos ultimos dias e o status da BM. Se for criativo mesmo, talvez vale voltar pro anterior pra estancar."
+
+NAO copia esse texto. Adapta pro caso real."""
+    ,
+    "comercial_des": """Uma reclamacao comercial DES chegou pelo Fofoqueiro no grupo "{group_name}":
+
+"{msg_text}"
+
+DADOS REAIS JA BUSCADOS:
+{context_block}
+
+Sua missao: avisar a {dri_name_for_prompt} sobre possivel gargalo comercial, sem tom de cobranca.
+
+ESTILO:
+- Comeca com "{dri_name_for_prompt}, "
+- Maximo 6 linhas
+- Explica quem reclamou, qual risco comercial parece existir e qual primeiro passo checar
+- Se tiver lead facts, usa esses dados. Se nao tiver, nao inventa numero
+- Nao usa markdown pesado nem lista numerada
+- Fecha com "Card #{card_id}" pra DRI conseguir dar ACK com "vi #{card_id}".""",
+    "suporte": """Uma reclamacao de suporte/operacao chegou pelo Fofoqueiro no grupo "{group_name}":
+
+"{msg_text}"
+
+DADOS REAIS JA BUSCADOS:
+{context_block}
+
+Sua missao: avisar a {dri_name_for_prompt} com contexto suficiente para ela decidir se e plataforma, atendimento, acesso ou falha de agente.
+
+ESTILO:
+- Comeca com "{dri_name_for_prompt}, "
+- Maximo 6 linhas
+- Tom de equipe, sem acusar ninguem
+- Se houver dado indisponivel, diga "ainda nao consegui puxar X agora"
+- Traz 1 primeiro passo pratico
+- Fecha com "Card #{card_id}" pra DRI conseguir dar ACK com "vi #{card_id}".""",
+    "juridico": """Uma reclamacao juridica chegou pelo Fofoqueiro no grupo "{group_name}":
+
+"{msg_text}"
+
+DADOS REAIS JA BUSCADOS:
+{context_block}
+
+Sua missao: avisar a {dri_name_for_prompt} de forma objetiva, separando risco juridico real de ruido operacional.
+
+ESTILO:
+- Comeca com "{dri_name_for_prompt}, "
+- Maximo 6 linhas
+- Nao da parecer juridico definitivo
+- Diga qual ponto ela precisa checar primeiro: prazo, documento, peticao, processo ou orientacao da mentoria
+- Nao inventa numero nem status processual
+- Fecha com "Card #{card_id}" pra DRI conseguir dar ACK com "vi #{card_id}".""",
+    "outro": """Uma reclamacao nao categorizada chegou pelo Fofoqueiro no grupo "{group_name}":
+
+"{msg_text}"
+
+DADOS REAIS JA BUSCADOS:
+{context_block}
+
+Sua missao: avisar a {dri_name_for_prompt} com resumo curto e proximo primeiro passo.
+
+ESTILO:
+- Comeca com "{dri_name_for_prompt}, "
+- Maximo 6 linhas
+- Nao inventa categoria, numero ou responsavel
+- Pede triagem humana quando o dado estiver fraco
+- Fecha com "Card #{card_id}" pra dar ACK com "vi #{card_id}".""",
+}
+
+
+def _prompt_for_category(category: str) -> str:
+    return CATEGORY_PROMPTS.get(category) or CATEGORY_PROMPTS["outro"]
+
+
+async def _run_trafego_goal(event_id: int, body: dict[str, Any]) -> None:
+    """SPEC-117 task 03 — Goal real cruzando Meta Ads + leads + transcricoes.
+
+    Usa /v1/chat/completions loopback do proprio Hermes (port 8642).
+    Tools registradas no Hermes sao auto-disponiveis (86 MCP tools).
+    Output substitui o template antigo. Em caso de erro, fallback template.
+    """
+    pool = await _get_pool()
+    category = body.get("category", "trafego_pago")
+    mentorada_name = body.get("mentorada_name") or "(nao identificada)"
+    mentorada_id = body.get("mentorada_id")
+    group_name = body.get("group_name") or "(grupo)"
+    msg_text = (body.get("msg_text") or "").strip()
+    card_id = body.get("card_id") or f"event-{event_id}"
+
+    diagnosis = ""
+    goal_status = "notified"
+    tools_data: dict[str, Any] = {}
+
+    try:
+        # Mentorada nao mapeada → fallback Vini direto sem Goal
+        if not mentorada_id:
+            dri = {"name": "Vinicius", "phone": VINI_PHONE}
+            diagnosis = (
+                f"⚠️ Mentorada NAO identificada no grupo {group_name}.\n"
+                f"Trecho cru:\n\"{msg_text[:280]}\"\n\n"
+                f"Card #{card_id} aberto. Verifique mapping group_jid em mentoradas."
+            )
+        else:
+            dri = _resolve_dri(category)
+            from agent.extensions.trafego_prefetch import (
+                format_context_for_prompt,
+                pre_fetch_mentorada_context,
+            )
+
+            tools_data = await pre_fetch_mentorada_context(body)
+            context_block = format_context_for_prompt(tools_data)
+
+            # SPEC-117 task 03 — DeepSeek API direta (sem loopback Hermes pra evitar deadlock)
+            # Formato rico baseado na mensagem da mentorada + dados reais ja materializados.
+            user_prompt = _prompt_for_category(category).format(
+                mentorada_name=mentorada_name,
+                mentorada_id=mentorada_id,
+                group_name=group_name,
+                category=category,
+                msg_text=msg_text[:500],
+                card_id=card_id,
+                dri_name_for_prompt=dri.get("name", "DRI").split()[0],
+                context_block=context_block,
+            )
+            deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+            # deepseek-chat (nao-reasoning) — output direto, ~3x mais rapido que v4-pro pra formatacao
+            deepseek_model = os.getenv("HERMES_TRAFEGO_GOAL_MODEL", "deepseek-chat").strip()
+            if not deepseek_key:
+                raise RuntimeError("DEEPSEEK_API_KEY ausente")
+
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {deepseek_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": deepseek_model,
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "Tu es Hermes, supervisor operacional em portugues BR. Diagnostico curto, direto, humano. Usa apenas dados reais recebidos no prompt.",
+                                },
+                                {
+                                    "role": "user",
+                                    "content": user_prompt,
+                                },
+                            ],
+                            "max_tokens": 500,
+                            "temperature": 0.3,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=45),
+                    ) as resp:
+                        data = await resp.json()
+                        content = (
+                            data.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
+                        if content and len(content) > 50:
+                            diagnosis = content.strip()
+                        else:
+                            raise ValueError(
+                                f"DeepSeek output curto/vazio: {content[:100]}"
+                            )
+            except Exception as goal_exc:
+                logger.warning(
+                    "[trafego] event_id=%s Goal real falhou (%s) — fallback template",
+                    event_id,
+                    goal_exc,
+                )
+                goal_status = "goal_fallback"
+                diagnosis = (
+                    f"🔔 Card #{card_id} — categoria {category}\n"
+                    f"Mentorada: {mentorada_name}\n"
+                    f"Grupo: {group_name}\n\n"
+                    f"Trecho:\n\"{msg_text[:280]}\"\n\n"
+                    f"⚠️ Diagnostico cruzado falhou (Hermes Goal nao executou). "
+                    f"Verifica manualmente."
+                )
+
+        # envia WhatsApp via bridge Hermes
+        sent_ok = await _send_whatsapp(dri["phone"], diagnosis)
+        if not sent_ok:
+            goal_status = "send_failed"
+
+        async with pool.acquire() as con:
+            await con.execute(
+                """
+                UPDATE hermes_event_log
+                SET status = $1,
+                    dri_phone = $2,
+                    dri_name = $3,
+                    dri_notified_at = NOW(),
+                    goal_diagnosis = $4,
+                    tools_data = $5::jsonb,
+                    updated_at = NOW()
+                WHERE id = $6
+                """,
+                goal_status,
+                dri["phone"],
+                dri["name"],
+                diagnosis,
+                json.dumps(tools_data, ensure_ascii=False),
+                event_id,
+            )
+        logger.info(
+            "[trafego] event_id=%s status=%s DRI=%s phone=%s",
+            event_id,
+            goal_status,
+            dri["name"],
+            dri["phone"],
+        )
+    except Exception:
+        logger.exception("[trafego] Goal task failed event_id=%s", event_id)
+        try:
+            async with pool.acquire() as con:
+                await con.execute(
+                    "UPDATE hermes_event_log SET status='goal_error', updated_at=NOW() WHERE id=$1",
+                    event_id,
+                )
+        except Exception:
+            pass
+
+
+async def _send_whatsapp(phone: str, message: str) -> bool:
+    chat_id = f"{phone}@s.whatsapp.net"
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                BRIDGE_SEND_URL,
+                json={"chatId": chat_id, "message": message},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                ok = 200 <= resp.status < 300
+                if not ok:
+                    txt = await resp.text()
+                    logger.warning(
+                        "[trafego] /send falhou status=%s body=%s",
+                        resp.status,
+                        txt[:200],
+                    )
+                return ok
+    except Exception as exc:
+        logger.warning("[trafego] /send exception: %s", exc)
+        return False
+
+
+async def handle_trafego_ack(request: web.Request) -> web.Response:
+    provided = (
+        request.headers.get("X-Hermes-Token")
+        or request.headers.get("X-Fofo-Token")
+        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    )
+    if ACK_TOKEN and provided != ACK_TOKEN:
+        return web.json_response({"ok": False, "reason": "unauthorized"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "reason": "invalid_json"}, status=400)
+
+    text = str(body.get("text") or body.get("body") or "")
+    sender_phone = str(body.get("senderPhone") or body.get("sender_phone") or "")
+    sender_phone = re.sub(r"\D+", "", sender_phone)
+    card_id = body.get("card_id") or parse_ack_card_id(text)
+    if not card_id:
+        return web.json_response({"ok": False, "reason": "no_card_id"}, status=400)
+    if sender_phone not in _dri_phones():
+        return web.json_response({"ok": False, "reason": "sender_not_dri"}, status=403)
+
+    result = await process_trafego_ack(sender_phone=sender_phone, card_id=str(card_id))
+    status = 200 if result.get("ok") else 404
+    return web.json_response(result, status=status)
+
+
+async def process_trafego_ack(sender_phone: str, card_id: str) -> dict[str, Any]:
+    pool = await _get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            """
+            UPDATE hermes_event_log
+            SET ack_received_at = COALESCE(ack_received_at, NOW()),
+                status = 'acked',
+                updated_at = NOW()
+            WHERE card_id = $1
+              AND dri_phone = $2
+              AND status IN ('notified', 'goal_fallback', 'escalated_l1', 'escalated_l2')
+            RETURNING id, mentorada_name, dri_name, dri_notified_at
+            """,
+            str(card_id),
+            sender_phone,
+        )
+        if not row:
+            return {"ok": False, "reason": "card_not_found_or_sender_mismatch"}
+
+    classifier_ok = await _post_classifier_ack(card_id=str(card_id), sender_phone=sender_phone)
+    delta_seconds = None
+    if row["dri_notified_at"]:
+        delta_seconds = int(
+            (datetime.now(UTC) - row["dri_notified_at"]).total_seconds()
+        )
+    minutes = max(0, int((delta_seconds or 0) / 60))
+    await _send_whatsapp(
+        sender_phone,
+        f"Card #{card_id} ack recebido. Registrei no Hermes em {minutes}min.",
+    )
+    return {
+        "ok": True,
+        "event_id": row["id"],
+        "card_id": str(card_id),
+        "classifier_ack_ok": classifier_ok,
+        "delta_seconds": delta_seconds,
+    }
+
+
+async def _post_classifier_ack(card_id: str, sender_phone: str) -> bool:
+    token = os.environ.get("TRAFEGO_API_TOKEN") or os.environ.get("FOFO_INBOUND_TOKEN") or ""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{TRAFEGO_API_URL}/api/trafego/cards/{card_id}/ack",
+                json={"owner": sender_phone, "source": "hermes_ack"},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                logger.warning("[trafego] classifier ack status=%s", resp.status)
+                return False
+    except Exception as exc:
+        logger.warning("[trafego] classifier ack exception: %s", exc)
+        return False
+
+
+# ---- mount ----
+def mount_trafego_subapp(parent_app: web.Application, adapter: Any) -> None:
+    """Monta route direto em /api/webhook/trafego-card-event.
+
+    NAO usa add_subapp("/api/webhook", ...) porque alerts_router ja registra
+    esse prefix e aiohttp nao aceita subapps duplicados no mesmo prefix.
+    """
+    parent_app.router.add_post(
+        "/api/webhook/trafego-card-event", handle_trafego_card_event
+    )
+    parent_app.router.add_post(
+        "/api/webhook/trafego-ack", handle_trafego_ack
+    )
+    parent_app.router.add_post(
+        "/api/trafego/hermes-ack", handle_trafego_ack
+    )
+    logger.info(
+        "[custom_extensions] trafego routes mounted"
+    )
