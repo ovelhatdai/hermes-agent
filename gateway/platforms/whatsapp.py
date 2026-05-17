@@ -42,6 +42,13 @@ _CONTENT_CAPTURE_TRIGGERS = (
     "guarda essa ideia:",
     "anota ai",
     "guarda essa",
+    "manda pra daiane gravar:",
+    "manda pra dai gravar:",
+    "roteiro daiane:",
+    "roteiro dai:",
+    "gera roteiro pra daiane sobre:",
+    "vídeo pra daiane:",
+    "video pra daiane:",
 )
 _CONTENT_CAPTURE_ALLOWED_SENDERS = (
     "143658066157619@lid",
@@ -1344,7 +1351,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
         theme = result.get("theme") or "Ideia capturada para revisar"
         hook = result.get("hook") or "Revisar manualmente"
 
-        if status == "scripted":
+        if status == "awaiting_vini_approval":
+            confirmation = result.get("reply_text") or (
+                f"Montei o roteiro pra Daiane: {theme}\n"
+                "Confirma envio pra Daiane?"
+            )
+        elif status == "sent_to_daiane":
+            confirmation = result.get("reply_text") or "Roteiro enviado pra Daiane."
+        elif status == "scripted":
             script_path = result.get("script_path") or "roteiros/"
             confirmation = (
                 "Roteiro gerado.\n"
