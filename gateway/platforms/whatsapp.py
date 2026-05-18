@@ -96,6 +96,12 @@ _CONTENT_IMAGE_WORKER = os.getenv(
     "CONTENT_IMAGE_WORKER",
     str(_CONTENT_MEDIA_ROOT / "content_image_pipeline.py"),
 )
+_CONTENT_MEDIA_INTENT_ROUTER = Path(
+    os.getenv(
+        "CONTENT_MEDIA_INTENT_ROUTER",
+        str(_CONTENT_MEDIA_ROOT.parent / "media_intent_router.py"),
+    )
+)
 _CONTENT_MEDIA_APPROVAL_WORKER = os.getenv(
     "CONTENT_MEDIA_APPROVAL_WORKER",
     str(_CONTENT_MEDIA_ROOT / "content_media_approval.py"),
@@ -1699,6 +1705,53 @@ class WhatsAppAdapter(BasePlatformAdapter):
         )
         return True
 
+    def _load_content_media_intent_router_module(self):
+        module_path = _CONTENT_MEDIA_INTENT_ROUTER
+        if not module_path.is_file():
+            raise FileNotFoundError(f"media intent router ausente em {module_path}")
+        spec = importlib.util.spec_from_file_location("hermes_media_intent_router", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"falha ao carregar media intent router em {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    async def _handle_media_intent_router(self, event: MessageEvent, text: str) -> bool:
+        try:
+            router = self._load_content_media_intent_router_module()
+            route = router.build_media_intent_handler_decision(text)
+        except FileNotFoundError:
+            logger.exception("[%s] media intent router missing", self.name)
+            return False
+        except Exception as exc:
+            logger.exception("[%s] media intent router failed open: %s", self.name, exc)
+            return False
+
+        if getattr(route, "needs_clarification", False):
+            await self.send(
+                event.source.chat_id,
+                route.clarification_message,
+                reply_to=event.message_id,
+            )
+            return True
+
+        if getattr(route, "should_create_job", False):
+            tipo = str(getattr(route, "tipo", "") or "midia")
+            await self.send(
+                event.source.chat_id,
+                f"Entendi esse pedido como {tipo}. Ainda nao criei job nem gastei creditos; essa etapa entra no proximo deploy da SPEC-178.",
+                reply_to=event.message_id,
+            )
+            logger.info(
+                "[%s] media intent routed tipo=%s pattern=%s",
+                self.name,
+                tipo,
+                getattr(route, "matched_pattern", None),
+            )
+            return True
+
+        return False
+
     async def _handle_content_media_shortcut(self, event: MessageEvent) -> bool:
         if getattr(event.source, "chat_type", "") != "dm":
             return False
@@ -1709,6 +1762,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return False
 
         text = (event.text or "").strip()
+        if await self._handle_media_intent_router(event, text):
+            return True
         command, _ = self._split_content_media_command(text)
         if not command:
             return False
